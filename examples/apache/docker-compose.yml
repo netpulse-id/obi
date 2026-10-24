@@ -1,0 +1,68 @@
+services:
+  edge-apache:
+    image: httpd:2.4.69-alpine@sha256:3440c39d8d6f54fa9ad2549e5a60c19ddd435faadc29c1ad28aa795f71888889
+    container_name: edge-apache
+    network_mode: host
+    volumes:
+      - ./docker/edge/httpd.conf:/usr/local/apache2/conf/httpd.conf:ro
+      - ./shared:/usr/local/apache2/conf/shared:ro
+      - ./htdocs:/usr/local/apache2/htdocs:ro
+    depends_on:
+      - recommendations-v1
+      - recommendations-v2
+
+  recommendations-v1:
+    image: httpd:2.4.69-alpine@sha256:3440c39d8d6f54fa9ad2549e5a60c19ddd435faadc29c1ad28aa795f71888889
+    container_name: recommendations-v1-apache
+    network_mode: host
+    volumes:
+      - ./docker/recommendations-v1/httpd.conf:/usr/local/apache2/conf/httpd.conf:ro
+      - ./shared:/usr/local/apache2/conf/shared:ro
+      - ./htdocs:/usr/local/apache2/htdocs:ro
+
+  recommendations-v2:
+    image: httpd:2.4.69-alpine@sha256:3440c39d8d6f54fa9ad2549e5a60c19ddd435faadc29c1ad28aa795f71888889
+    container_name: recommendations-v2-apache
+    network_mode: host
+    volumes:
+      - ./docker/recommendations-v2/httpd.conf:/usr/local/apache2/conf/httpd.conf:ro
+      - ./shared:/usr/local/apache2/conf/shared:ro
+      - ./htdocs:/usr/local/apache2/htdocs:ro
+    depends_on:
+      - recommendations-v1
+
+  traffic-generator:
+    build:
+      context: .
+      dockerfile: traffic-runner/Dockerfile
+    container_name: apache-traffic-generator
+    network_mode: host
+    command:
+      - --base-url
+      - http://127.0.0.1:8080
+      - --progress-seconds
+      - "15"
+    depends_on:
+      - edge-apache
+
+  obi:
+    image: ${OBI_IMAGE:-otel/ebpf-instrument:v0.14.0@sha256:0b063b9ec47e10dd4503ce1dc21f273acd3c85ffc9c135f0b753ee64de9c0819}
+    container_name: obi-apache-example
+    command:
+      - --config=/config/obi-config.yaml
+    network_mode: host
+    pid: host
+    privileged: true
+    volumes:
+      - ./docker/obi-config.yaml:/config/obi-config.yaml:ro
+    depends_on:
+      - edge-apache
+      - recommendations-v1
+      - recommendations-v2
+      - traffic-generator
+      - lgtm
+
+  lgtm:
+    image: grafana/otel-lgtm:0.37.0@sha256:57b5ab1ca6619beb180174e2fccce04762470750669d043f544b4726d0582d07
+    container_name: lgtm-apache-example
+    network_mode: host

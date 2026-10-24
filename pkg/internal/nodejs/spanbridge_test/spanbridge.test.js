@@ -1,0 +1,293 @@
+'use strict';
+// Behavioral tests for ../spanbridge.js — the injected OBI Node.js manual-span
+// bridge. Each scenario runs in its own process (see scenario.js) because the
+// @opentelemetry/api global registry is a process singleton.
+//
+// Run: cd pkg/internal/nodejs/spanbridge_test && npm ci && node --test
+
+const test = require('node:test');
+const assert = require('node:assert');
+const { execFileSync } = require('node:child_process');
+const path = require('node:path');
+
+function runScenario(name) {
+  const out = execFileSync(process.execPath, [path.join(__dirname, 'scenario.js'), name], {
+    encoding: 'utf8',
+  });
+  return JSON.parse(out);
+}
+
+function runScript(file) {
+  const out = execFileSync(process.execPath, [path.join(__dirname, file)], { encoding: 'utf8' });
+  return JSON.parse(out);
+}
+
+test('api-only app: bridge captures manual spans', () => {
+  const r = runScenario('api-only');
+  assert.deepStrictEqual(r.bridge, ['s1']);
+  assert.deepStrictEqual(r.app, []);
+});
+
+test('SDK loaded but never registered: bridge still captures (no false skip)', () => {
+  // Depending on / loading the SDK is not the same as using it. An app that
+  // migrated to OBI but left the dependency, or loaded it disabled, still
+  // gets its manual spans captured.
+  const r = runScenario('sdk-loaded-not-registered');
+  assert.deepStrictEqual(r.bridge, ['s1']);
+});
+
+test('SDK already registered before injection: bridge stays inert', () => {
+  const r = runScenario('sdk-already-registered');
+  assert.deepStrictEqual(r.bridge, [], 'bridge must not capture when an SDK owns the API');
+  assert.deepStrictEqual(r.app, ['s1'], 'the app SDK captures its own span');
+});
+
+// Every other test in this suite stubs the transport, so this is the only
+// place the real fs.existsSync runs. The whole mechanism rests on it answering
+// a path that cannot resolve by returning rather than throwing, and this file
+// runs on the CI Node matrix, so that assumption is checked per version here
+// instead of only in the author's harness.
+test('the real fs.existsSync answers a sentinel path without throwing', () => {
+  const realFs = require('fs');
+  let threw = null;
+  let result;
+  try {
+    result = realFs.existsSync('/dev/null/obi-span/{"name":"probe"}');
+  } catch (e) {
+    threw = String((e && e.message) || e);
+  }
+  assert.strictEqual(threw, null, 'fs.existsSync must not throw on a sentinel path');
+  assert.strictEqual(result, false, 'a sentinel path must not resolve');
+});
+
+test('throwing transport: span.end() never throws into the app', () => {
+  // fs.existsSync does not throw for a path that simply does not exist, but it
+  // can under Node's permission model. The guard around the emit is the only
+  // thing keeping that out of application code, so it is exercised here rather
+  // than left to the transport never failing.
+  const r = runScenario('throwing-transport');
+  assert.strictEqual(r.threw, null, 'span.end() must not throw when the transport does');
+  assert.deepStrictEqual(r.bridge, ['s1'], 'the span is still emitted before the transport fails');
+});
+
+test('hostile attribute/name: span.end() never throws into the app', () => {
+  // A value whose toString() throws must not escape span.end() — the baseline
+  // (no SDK) is a silent NoopSpan, so a throw here would be a regression that
+  // could crash a request from its finally block.
+  const r = runScenario('hostile-attribute');
+  assert.strictEqual(r.threw, null, 'span.end() must not throw on a hostile attribute/name');
+  assert.deepStrictEqual(r.bridge, ['s1'], 'the span is still captured despite the bad value');
+});
+
+test('api loaded AFTER injection: late copy is still wired, app SDK wins handoff', () => {
+  // The bridge injects before @opentelemetry/api is ever required. A copy
+  // loaded afterwards must have its global setters wrapped (module-load hook),
+  // so the app's late SDK registration yields the bridge instead of being
+  // refused as a duplicate. Without the hook, 'after' would land in the bridge.
+  const r = runScript('scenario_late_load.js');
+  assert.deepStrictEqual(r.bridge, ['before'], 'bridge captures only the pre-registration span');
+  assert.ok(r.app.includes('after'), 'the app SDK captures spans once it registers');
+  assert.ok(!r.bridge.includes('after'), 'bridge must stop capturing after the late SDK registers');
+});
+
+test('active manual spans publish -mspan/ override and restore on unwind', () => {
+  // The bridge points traces_ctx_v1 at the innermost active manual span so
+  // OBI's eBPF client spans nest under it, then restores the enclosing span (or
+  // pops to none) as each scope unwinds. For nested startActiveSpan('outer' >
+  // 'inner'): override(outer), override(inner), restore(outer) on inner exit,
+  // pop on outer exit.
+  const r = runScenario('mspan-nesting');
+  assert.deepStrictEqual(r.mspan, ['outer', 'inner', 'outer', 'pop']);
+  assert.deepStrictEqual(r.bridge, ['inner', 'outer'], 'both spans are still captured');
+});
+
+test('the manual-span override carries the request fd when there is one', () => {
+  // traces_ctx_v1 is not populated for manual spans alone, so the fd is what
+  // gives the override the request's trace id to keep.
+  const r = runScenario('mspan-request-fd');
+  assert.deepStrictEqual(r.mspan, [52, 'pop', 48, 'pop']);
+  assert.strictEqual(r.fd, '0007');
+});
+
+test('a span ending in an async callback releases its override', () => {
+  // The override must not outlive the callback: nothing else clears it when no
+  // further callback runs (a timer in an idle process, work outside a request),
+  // so eBPF client spans and enriched log lines would keep carrying an ended
+  // span. The 'after' boundary pops it.
+  const r = runScenario('mspan-async-release');
+  assert.ok(r.mspan.includes('override'), 'the active span must publish an override');
+  assert.strictEqual(r.mspan[r.mspan.length - 1], 'pop', 'the last sentinel must release it');
+  assert.deepStrictEqual(r.bridge, ['job'], 'the span is still captured');
+});
+
+test('re-injection keeps the override hook after the context-refresh hook', () => {
+  // async_hooks fire in enable order; a re-injected fdextractor re-enables its
+  // '-ctx' hook, which would then erase the override every callback unless the
+  // bridge moves its own hook back last on re-injection.
+  const r = runScript('scenario_reinject.js');
+  assert.strictEqual(
+    r.stateInContinuation,
+    'manual',
+    'the override must run after the competing context-refresh hook'
+  );
+});
+
+test('native ESM app: bridge captures and the late SDK still wins the handoff', () => {
+  // `import '@opentelemetry/api'` resolves to the package's CommonJS entry, so
+  // it flows through the Module._load hook: the bridge wires the copy, captures
+  // the pre-registration span, and yields cleanly when the app's SDK registers.
+  const r = runScript('scenario_esm.mjs');
+  assert.deepStrictEqual(r.bridge, ['before'], 'bridge captures the pre-registration span in an ESM app');
+  assert.ok(r.app.includes('after'), 'the app SDK captures spans once it registers');
+  assert.ok(!r.bridge.includes('after'), 'bridge stops capturing after the ESM app registers its SDK');
+});
+
+test('bundled/unreachable api copy: bridge never blocks the app SDK registration', () => {
+  // A bundled (inlined) api copy is invisible to the module loader, so the
+  // bridge cannot wire it. Under Solution 1 the bridge never occupies the
+  // global registry, so the app's own SDK still registers and takes over — the
+  // property that matters. The trade-off (documented limitation) is that the
+  // bundled app's manual spans are not captured.
+  const r = runScript('scenario_bundled.js');
+  assert.ok(r.app.includes('bundled-after'), 'the app SDK registers and captures its spans (not blocked)');
+  assert.deepStrictEqual(r.bridge, [], 'bundled spans are not captured — the accepted limitation');
+});
+
+test('mixed reachable + unreachable copies: registry-appearance drives the handoff', () => {
+  // A reachable copy caches our tracer (bridge emitting), while a bundled copy
+  // registers the app SDK straight into the global registry, bypassing the
+  // setter we wrap. Without treating the registry provider as a handoff signal,
+  // the cached tracer would keep emitting OBI spans alongside the app's SDK.
+  const r = runScript('scenario_mixed_copy.js');
+  assert.deepStrictEqual(r.bridge, ['before'], 'bridge captures only the pre-registration span');
+  assert.ok(r.app.includes('after'), "the reachable copy's cached tracer routes to the app once its provider is in the registry");
+  assert.ok(!r.bridge.includes('after'), 'bridge must stop emitting once the app provider appears in the registry');
+});
+
+test('external parent contexts are flagged; bridge-owned parents are not', () => {
+  // A parent SpanContext the bridge does not own must be flagged extParent so
+  // user space flattens the span under the OBI request parent when re-anchoring
+  // (keeping the external psid would export a cross-trace parent reference).
+  // In-bridge nesting must stay unflagged — its chain survives re-anchoring.
+  const r = runScript('scenario_ext_parent.js');
+  assert.deepStrictEqual(r.names.sort(), ['bridge-child', 'bridge-root', 'orphan', 'with-ext-parent']);
+  assert.strictEqual(r.ext.extParent, true, 'external parent must be flagged extParent');
+  assert.strictEqual(r.ext.psid, 'bbbbbbbbbbbbbbbb', 'external parent span id is carried');
+  assert.strictEqual(r.ext.tid, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'span joins the external trace');
+  assert.strictEqual(r.child.extParent, undefined, 'bridge-owned parent must NOT be flagged');
+  assert.strictEqual(r.child.psid, r.root.sid, 'nested span keeps its in-bridge parent chain');
+  assert.strictEqual(r.root.extParent, undefined, 'root without external parent is unflagged');
+  assert.strictEqual(r.orphan.psid, undefined, 'orphan has no parent id');
+  assert.strictEqual(r.orphan.extParent, undefined, 'orphan is unflagged');
+});
+
+test('multibyte strings truncate on a valid UTF-8 byte boundary', () => {
+  // Attribute keys/values and names are budgeted in UTF-8 BYTES (the Go side
+  // copies into fixed byte arrays). A multibyte character straddling the
+  // budget must be dropped whole, never split into invalid UTF-8.
+  const r = runScript('scenario_multibyte.js');
+  assert.ok(r.keyBytes <= 31, `key must fit its 31-byte budget (got ${r.keyBytes})`);
+  assert.ok(r.keyOK, 'key must be whole characters (15 x é), no split sequence');
+  assert.ok(r.valueBytes <= 127, `value must fit its 127-byte budget (got ${r.valueBytes})`);
+  assert.ok(r.valueOK, 'value must be whole characters (42 x €), no split sequence');
+  assert.ok(r.nameBytes <= 128, `name must fit its 128-byte budget (got ${r.nameBytes})`);
+  assert.ok(r.nameOK, 'name must be whole characters (42 x €), no split sequence');
+});
+
+test('explicit span.end(t) rides as endWallNs; absent otherwise', () => {
+  // A valid TimeInput (Date, epoch millis, hrtime tuple) must be carried in
+  // the payload as epoch nanoseconds; no argument or an unusable one must
+  // omit the field so user space keeps the kernel-side sentinel anchor.
+  const r = runScript('scenario_end_time.js');
+  assert.deepStrictEqual(r.names, [
+    'end-bogus',
+    'end-date',
+    'end-frac',
+    'end-hrtime',
+    'end-huge',
+    'end-millis',
+    'end-near-origin',
+    'end-none',
+    'end-perf',
+  ]);
+  assert.strictEqual(r.date, r.dateExpected, 'Date end time must convert to epoch ns');
+  assert.strictEqual(r.millis, r.millisExpected, 'epoch-millis end time must convert to epoch ns');
+  assert.strictEqual(r.hrtime, r.hrtimeExpected, 'hrtime tuple must convert to epoch ns');
+  assert.strictEqual(r.none, undefined, 'no explicit end -> no endWallNs');
+  assert.strictEqual(r.bogus, undefined, 'unusable explicit end -> no endWallNs');
+  assert.ok(
+    r.perf !== undefined && BigInt(r.perf) >= BigInt(r.perfLowerBoundNs),
+    'performance.now()-style end must resolve against timeOrigin, not 1970'
+  );
+  const fracRemainderNs = Number(BigInt(r.frac) - BigInt(r.fracWholeMsNs));
+  assert.ok(
+    Math.abs(fracRemainderNs - 456000) < 1000,
+    `fractional epoch millis keep sub-ms precision (got remainder ${fracRemainderNs}ns)`
+  );
+  assert.strictEqual(r.huge, undefined, 'int64-unrepresentable end -> no endWallNs');
+  assert.strictEqual(
+    r.nearOrigin,
+    r.nearOriginExpected,
+    'an epoch-millis end just below timeOrigin is still an epoch timestamp'
+  );
+});
+
+test('versioned pre-acquired tracer keeps name/version/options through the handoff', () => {
+  const r = runScript('scenario_versioned_tracer.js');
+  assert.deepStrictEqual(r.bridge, ['before'], 'bridge captures only the pre-registration span');
+  assert.deepStrictEqual(
+    r.app.map((s) => s.name),
+    ['after'],
+    'the app SDK captures the post-registration span'
+  );
+  assert.deepStrictEqual(
+    r.app[0].scope,
+    { name: 'app', version: '1.2.3', schemaUrl: 'https://example.com/1.2.3' },
+    'the app-exported span keeps the declared scope identity'
+  );
+  const fwd = r.forwarded.find((f) => f.name === 'app');
+  assert.ok(fwd, 'the bridge forwards getTracer to the app provider');
+  assert.strictEqual(fwd.version, '1.2.3', 'original version is forwarded');
+  assert.deepStrictEqual(
+    fwd.options,
+    { schemaUrl: 'https://example.com/1.2.3' },
+    'original options (schemaUrl) are forwarded'
+  );
+});
+
+test('SDK registers after injection: bridge yields and the app SDK takes over', () => {
+  const r = runScenario('late-sdk');
+  assert.deepStrictEqual(r.bridge, ['before'], 'bridge captures only the pre-handover span');
+  assert.ok(r.app.includes('after-new'), 'app SDK captures spans from newly-acquired tracers');
+  assert.ok(
+    r.app.includes('after-preacquired'),
+    'a tracer acquired before injection also routes to the app SDK after handover'
+  );
+  assert.ok(
+    !r.bridge.includes('after-new') && !r.bridge.includes('after-preacquired'),
+    'bridge stops emitting once the app SDK is registered'
+  );
+});
+
+test('span sentinel carries the request fd; no fd or a too-wide fd falls back to the plain form', () => {
+  const r = runScenario('request-fd');
+  assert.deepStrictEqual(r.bridge, ['in-request', 'no-request', 'fd-too-wide']);
+  assert.deepStrictEqual(r.fds, ['0042', null, null]);
+});
+
+test('bridge without fdextractor emits the plain sentinel', () => {
+  const r = runScenario('no-fdextractor');
+  assert.deepStrictEqual(r.bridge, ['s1']);
+  assert.deepStrictEqual(r.fds, [null]);
+});
+
+test('pooled span and trace ids stay unique and well-formed across pool refills', () => {
+  const r = runScenario('id-pool');
+  assert.strictEqual(r.ids.length, 400);
+  assert.strictEqual(new Set(r.ids.map((i) => i.tid)).size, 400, 'trace ids must not repeat');
+  assert.strictEqual(new Set(r.ids.map((i) => i.sid)).size, 400, 'span ids must not repeat');
+  for (const { tid, sid } of r.ids) {
+    assert.match(tid, /^[0-9a-f]{32}$/);
+    assert.match(sid, /^[0-9a-f]{16}$/);
+  }
+});

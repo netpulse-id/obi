@@ -1,0 +1,53 @@
+# Weaver semantic convention validator — receives OTLP from the collector
+# and validates emitted telemetry against the OBI schema registry under
+# `schemas/obi/`, which itself depends on the upstream OpenTelemetry
+# semantic conventions. Bind-mounted into the container at /obi-registry.
+#
+# Shared definition extended by every weaver-wired compose under
+# `internal/test/integration/`. Each consumer pulls this in via:
+#
+#   weaver:
+#     extends:
+#       file: components/weaver/service.yml
+#       service: weaver
+#     volumes:
+#       - ../../../schemas/obi:/obi-registry:ro
+#
+# The `volumes` mount is intentionally NOT defined here: relative paths in
+# volumes resolve against the file that declares them, so the consuming
+# compose must own its own bind mount or the registry path would be wrong.
+#
+# weaver runs with `--output http`: the test harness stops the run with the
+# admin /stop endpoint, reads the live-check report from /report and ends the
+# process with /shutdown.
+services:
+  weaver:
+    image: otel/weaver:v0.27.0@sha256:3049b4079049d4abb1b5632f511ada2c33505a1c60f3f8535e93f87f0696f056
+    container_name: weaver
+    user: "0:0"
+    working_dir: /obi-registry
+    command:
+      - registry
+      - live-check
+      - --registry
+      - /obi-registry
+      - --otlp-grpc-address
+      - "0.0.0.0"
+      - --admin-port
+      - "4320"
+      - --format
+      - compact
+      - --templates
+      - /obi-registry/.live_check_templates
+      - --diagnostic-format
+      - json
+      - --output
+      - http
+    ports:
+      - "4320:4320" # admin API (for the test host)
+    healthcheck:
+      test: ["CMD-SHELL", "wget --timeout=1 -q -O /dev/null http://127.0.0.1:4320/health"]
+      interval: 5s
+      timeout: 2s
+      retries: 60
+      start_period: 90s

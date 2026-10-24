@@ -1,0 +1,212 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package integration // import "go.opentelemetry.io/obi/internal/test/integration"
+
+import (
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"go.opentelemetry.io/obi/internal/test/integration/components/promtest"
+	ti "go.opentelemetry.io/obi/pkg/test/integration"
+)
+
+func testREDMetricsForPythonHTTPLibrary(t *testing.T, url, comm, namespace string) {
+	urlPath := "/greeting"
+
+	// Call 3 times the instrumented service, forcing it to:
+	// - take a large JSON file
+	// - returning a 200 code
+	for range 4 {
+		ti.DoHTTPGet(t, url+urlPath, 200)
+	}
+
+	// Eventually, Prometheus would make this query visible
+	pq := promtest.Client{HostPort: prometheusHostPort}
+	var results []promtest.Result
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		var err error
+		results, err = pq.Query(`http_server_request_duration_seconds_count{` +
+			`http_request_method="GET",` +
+			`http_response_status_code="200",` +
+			`service_namespace="` + namespace + `",` +
+			`service_name="` + comm + `",` +
+			`url_path="` + urlPath + `"}`)
+		require.NoError(ct, err)
+		enoughPromResults(ct, results)
+		val := totalPromCount(ct, results)
+		assert.LessOrEqual(ct, 3, val)
+		if len(results) > 0 {
+			res := results[0]
+			addr := res.Metric["client_address"]
+			assert.NotNil(ct, addr)
+		}
+	}, testTimeout, 100*time.Millisecond)
+}
+
+func testREDMetricsForPythonRoutes(t *testing.T, url, comm, namespace string) {
+	tests := []struct {
+		path  string
+		route string
+	}{
+		{path: "/api/customers/42", route: "/api/customers/<customer_id>"},
+		{path: "/files/a/b/c/d", route: "/files/<path:files>"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.path, func(t *testing.T) {
+			for range 4 {
+				ti.DoHTTPGet(t, url+tc.path, 200)
+			}
+
+			pq := promtest.Client{HostPort: prometheusHostPort}
+			var results []promtest.Result
+			require.EventuallyWithT(t, func(ct *assert.CollectT) {
+				var err error
+				results, err = pq.Query(`http_server_request_duration_seconds_count{` +
+					`http_request_method="GET",` +
+					`http_response_status_code="200",` +
+					`service_namespace="` + namespace + `",` +
+					`service_name="` + comm + `",` +
+					`http_route="` + tc.route + `",` +
+					`url_path="` + tc.path + `"}`)
+				require.NoError(ct, err)
+				enoughPromResults(ct, results)
+				assert.LessOrEqual(ct, 3, totalPromCount(ct, results))
+			}, testTimeout, 100*time.Millisecond)
+		})
+	}
+}
+
+func testREDMetricsTimeoutForPythonHTTPLibrary(t *testing.T, url, comm, namespace string) {
+	urlPath := "/black_hole"
+
+	doHTTPGetWithTimeout(t, url+urlPath, 3*time.Second)
+
+	// Eventually, Prometheus would make this query visible
+	pq := promtest.Client{HostPort: prometheusHostPort}
+	var results []promtest.Result
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		var err error
+		results, err = pq.Query(`http_server_request_duration_seconds_count{` +
+			`http_request_method="GET",` +
+			`http_response_status_code="408",` +
+			`service_namespace="` + namespace + `",` +
+			`service_name="` + comm + `",` +
+			`url_path="` + urlPath + `"}`)
+		require.NoError(ct, err)
+		enoughPromResults(ct, results)
+		val := totalPromCount(ct, results)
+		assert.LessOrEqual(ct, 1, val)
+		if len(results) > 0 {
+			res := results[0]
+			addr := res.Metric["client_address"]
+			assert.NotNil(ct, addr)
+		}
+	}, testTimeout, 100*time.Millisecond)
+}
+
+func testREDMetricsDNSForPython(t *testing.T, url, comm, namespace string) {
+	for range 4 {
+		ti.DoHTTPGet(t, url+"/ok_dns", 200)
+		ti.DoHTTPGet(t, url+"/bad_dns", 200)
+	}
+
+	// Eventually, Prometheus would make this query visible
+	pq := promtest.Client{HostPort: prometheusHostPort}
+	var results []promtest.Result
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		var err error
+		results, err = pq.Query(`dns_lookup_duration_seconds_count{` +
+			`dns_question_name="opentelemetry.io.",` +
+			`service_namespace="` + namespace + `",` +
+			`service_name="` + comm + `"}`)
+		require.NoError(ct, err)
+		enoughPromResults(ct, results)
+		val := totalPromCount(ct, results)
+		assert.LessOrEqual(ct, 1, val)
+
+		results, err = pq.Query(`dns_lookup_duration_seconds_count{` +
+			`dns_question_name="www.opentelemetry.invalid.",` +
+			`error_type="NXDomain",` +
+			`service_namespace="` + namespace + `",` +
+			`service_name="` + comm + `"}`)
+		require.NoError(ct, err)
+		enoughPromResults(ct, results)
+		val = totalPromCount(ct, results)
+		assert.LessOrEqual(ct, 1, val)
+	}, testTimeout, 100*time.Millisecond)
+}
+
+func testREDMetricsPythonHTTP(t *testing.T) {
+	for _, testCaseURL := range []string{
+		"http://localhost:8381",
+	} {
+		t.Run(testCaseURL, func(t *testing.T) {
+			waitForTestComponents(t, testCaseURL)
+			testREDMetricsForPythonHTTPLibrary(t, testCaseURL, "python-testserver", "integration-test")
+			testREDMetricsForPythonRoutes(t, testCaseURL, "python-testserver", "integration-test")
+		})
+	}
+}
+
+func testREDMetricsTimeoutPythonHTTP(t *testing.T) {
+	for _, testCaseURL := range []string{
+		"http://localhost:8381",
+	} {
+		t.Run(testCaseURL, func(t *testing.T) {
+			waitForTestComponents(t, testCaseURL)
+			testREDMetricsTimeoutForPythonHTTPLibrary(t, testCaseURL, "python-testserver", "integration-test")
+		})
+	}
+}
+
+func testREDMetricsDNSPython(t *testing.T) {
+	for _, testCaseURL := range []string{
+		"http://localhost:8381",
+	} {
+		t.Run(testCaseURL, func(t *testing.T) {
+			waitForTestComponents(t, testCaseURL)
+			testREDMetricsDNSForPython(t, testCaseURL, "python-testserver", "integration-test")
+		})
+	}
+}
+
+func testREDMetricsPythonHTTPS(t *testing.T) {
+	for _, testCaseURL := range []string{
+		"https://localhost:8381",
+	} {
+		t.Run(testCaseURL, func(t *testing.T) {
+			waitForTestComponents(t, testCaseURL)
+			testREDMetricsForPythonHTTPLibrary(t, testCaseURL, "python-testserver", "integration-test")
+		})
+	}
+}
+
+func checkReportedPythonEvents(t *testing.T, comm, namespace string, numEvents int) {
+	urlPath := "/greeting"
+
+	// Eventually, Prometheus would make this query visible
+	pq := promtest.Client{HostPort: prometheusHostPort}
+	var results []promtest.Result
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		var err error
+		results, err = pq.Query(`http_server_request_duration_seconds_count{` +
+			`http_request_method="GET",` +
+			`http_response_status_code="200",` +
+			`service_namespace="` + namespace + `",` +
+			`service_name="` + comm + `",` +
+			`url_path="` + urlPath + `"}`)
+		require.NoError(ct, err)
+		enoughPromResults(ct, results)
+		val := totalPromCount(ct, results)
+		assert.LessOrEqual(ct, val, numEvents)
+		if len(results) > 0 {
+			res := results[0]
+			addr := res.Metric["client_address"]
+			assert.NotNil(ct, addr)
+		}
+	}, testTimeout, 100*time.Millisecond)
+}

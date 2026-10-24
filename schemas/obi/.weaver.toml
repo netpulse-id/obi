@@ -1,0 +1,89 @@
+# weaver configuration for the OBI semantic-convention registry.
+#
+# Auto-discovered by every weaver command that runs from the registry working
+# directory. The `registry` section applies to all of them; the `live-check`
+# section only to `registry live-check`.
+#
+# This replaces two filters that previously lived in the Go harness
+# (internal/test/weavercheck): the advice-message ignore list and the
+# information-to-violation promotion. Weaver 0.25 can express both declaratively.
+
+# The registry is written in weaver's definition/2 format.
+[registry]
+v2 = true
+
+[live-check]
+# A v2 registry checks an attribute only against the definition its sample
+# matched. Searching every definition, including the upstream dependency, keeps
+# type, enum and stability checks on every attribute, and on resources, which
+# no definition describes.
+search_all_attributes = true
+# Weaver's default advice preprocessor builds its attribute sets from this
+# registry alone for a definition/2 registry, so upstream keys would fail
+# `invalid_format` and `extends_namespace`. `.live_check_policies` carries the
+# default policies and a preprocessor that adds the dependency's attributes.
+advice_policies = ".live_check_policies"
+advice_preprocessor = ".live_check_policies/advice.jq"
+
+# Promote advice weaver classifies as `information` to `violation` so live-check
+# fails on it. `extends_namespace` catches an attribute emitted under an existing
+# semconv namespace but declared in no registry; `undefined_enum_variant` catches
+# an enumerated attribute emitted with a value outside its declared members.
+[[live-check.finding_level_overrides]]
+ids = ["extends_namespace", "undefined_enum_variant"]
+level = "violation"
+
+# Accept the known namespace collisions OBI cannot avoid: the collector-contrib
+# servicegraph connector emits bare `server`/`client` labels, and netolly emits
+# `iface` alongside `iface.direction`, all colliding with upstream `*.address` /
+# `*.port` / `iface.direction` attributes. Scoped to those exact attribute
+# samples, so a collision on any other attribute still surfaces.
+[[live-check.finding_filters]]
+exclude = ["illegal_namespace"]
+sample_names = [
+  "server.address",
+  "server.port",
+  "client.address",
+  "client.port",
+  "iface.direction",
+]
+
+# Accept passthrough attributes OBI forwards but does not itself set. These are
+# valid semconv keys under namespaces OBI uses, so they surface as
+# missing_attribute / extends_namespace violations rather than being tolerated
+# as the sub-violation advice that unknown-namespace user attributes get — but
+# they are not part of OBI's emitted contract, so they are tolerated here
+# instead of declared:
+#   - deployment.environment.name: set by the workload via
+#     OTEL_RESOURCE_ATTRIBUTES and forwarded on the resource. Unlike
+#     service.version, OBI never derives it from a Kubernetes label.
+# Anything OBI actually sets is declared in the registry, so a new violation
+# here still means a real gap unless it is genuine passthrough added to this list.
+[[live-check.finding_filters]]
+exclude = ["missing_attribute", "extends_namespace"]
+sample_names = [
+  "deployment.environment.name",
+]
+
+# The legacy span metrics stay declared and marked deprecated in spanmetrics/metrics.yaml while
+# the deprecated `application_span` and `application_span_sizes` features still emit them.
+# Weaver reports any emitted deprecated metric as a violation; accept these four for the
+# compatibility window, scoped to their exact names so a deprecated emission of any other
+# metric still surfaces. Remove this filter together with the legacy emission paths.
+[[live-check.finding_filters]]
+exclude = ["deprecated"]
+sample_names = [
+  "traces_spanmetrics_calls_total",
+  "traces_spanmetrics_latency",
+  "traces_spanmetrics_size_total",
+  "traces_spanmetrics_response_size_total",
+]
+
+# OBI relays application-authored spans verbatim (its manual span feature), so the
+# attributes on them are chosen by the instrumented application and can never exist in
+# this registry. The integration test applications namespace theirs under `obitest.` so
+# a single scope covers all of them; an undeclared attribute outside that namespace,
+# including on any OBI-authored span, still surfaces.
+[[live-check.finding_filters]]
+exclude = ["missing_attribute"]
+sample_names = ["obitest.*"]

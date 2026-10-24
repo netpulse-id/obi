@@ -1,0 +1,1632 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package integration
+
+import (
+	"bufio"
+	"fmt"
+	"os"
+	"path"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"go.opentelemetry.io/obi/internal/test/integration/components/docker"
+	ti "go.opentelemetry.io/obi/pkg/test/integration"
+)
+
+// Digest-pinned obi-testimg references. These were previously selected at
+// compose-time via `${JAVA_TEST_MODE}` / `${TESTSERVER_IMAGE_SUFFIX}`
+// interpolation in the tag, which made it impossible to pin by sha256 and
+// left the integration suite vulnerable to a compromise of the OBI ghcr
+// publish workflow swapping in a malicious image.
+const (
+	obiTestImgJavaNative = "ghcr.io/open-telemetry/obi-testimg:java-native-0.1.5@sha256:0cbc4280dcf187a5d33a39dc1f2e8fc3d7cc6ad17533f859f9898292d9fb26c0"
+	obiTestImgJavaJar    = "ghcr.io/open-telemetry/obi-testimg:java-jar-0.1.5@sha256:7918fd747a6a1bd34f1fc1402a30fd6066e5e405296ad2b62070cf1488262cc4"
+	obiTestImgRust       = "ghcr.io/open-telemetry/obi-testimg:rust-0.1.5@sha256:bbfe374eae5ac96ef08fda0a8e28401775c7311f3b0d4fe510dec62852c3a58f"
+	obiTestImgRustSSL    = "ghcr.io/open-telemetry/obi-testimg:rust-ssl-0.1.5@sha256:bba89c0e7d3c1450eb2d7d2aa14bd175cdefe4b13ba736d344b43095d1813ecc"
+	obiTestImgRails      = "ghcr.io/open-telemetry/obi-testimg:rails-0.1.5@sha256:daa81133fee2d3882abc3129870baa9b85798537487aef47529c7c144b27f21c"
+	obiTestImgRailsSSL   = "ghcr.io/open-telemetry/obi-testimg:rails-ssl-0.1.5@sha256:00dc66268119e8a965f54e4407e5f20255d4d18ae56aefcdb111ab7aa781232a"
+)
+
+func TestSuite_Go(t *testing.T) {
+	type testCase struct {
+		name string
+		env  []string
+	}
+
+	for _, tc := range []testCase{
+		{name: "go-old-supported"},
+		{name: "go-latest", env: []string{"TESTSERVER_DOCKERFILE_SUFFIX=_latest", "PINGSERVER_DOCKERFILE_SUFFIX=_latest"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			compose, err := docker.ComposeSuite("docker-compose.yml", path.Join(pathOutput, "test-suite-"+tc.name+".log"))
+			require.NoError(t, err)
+			compose.Env = append(compose.Env, `OTEL_EBPF_EXECUTABLE_PATH=(pingclient|testserver)`)
+			compose.Env = append(compose.Env, tc.env...)
+			require.NoError(t, compose.Up())
+
+			// Cleanups run LIFO: register `compose.Close()` first so it runs
+			// last, *after* runWeaverValidation has had a chance to /stop the
+			// still-running weaver container.
+			t.Cleanup(func() {
+				require.NoError(t, compose.Close())
+			})
+			t.Cleanup(func() {
+				runWeaverValidation(t)
+			})
+
+			config := ti.DefaultOBIConfig()
+
+			t.Run("RED metrics", testREDMetricsHTTP)
+			t.Run("RED JSON RPC metrics", testREDMetricsJSONRPCHTTP)
+			t.Run("JSON RPC traces", testGoJSONRPCTraces)
+			t.Run("HTTP traces", testHTTPTraces)
+			t.Run("HTTP traces (no traceID)", testHTTPTracesNoTraceID)
+			t.Run("HTTP traces (url.query redaction)", testHTTPTracesURLQuery)
+			t.Run("HTTP traces (manual spans)", testHTTPTracesNestedManualSpans)
+			t.Run("GRPC traces", testGRPCTraces)
+			t.Run("GRPC RED metrics", testREDMetricsGRPC)
+			t.Run("GRPC TLS RED metrics", testREDMetricsGRPCTLS)
+			t.Run("Internal Prometheus metrics", func(t *testing.T) { ti.InternalPrometheusExport(t, config) })
+			t.Run("Exemplars exist", testExemplarsExist)
+			t.Run("Client RED metrics", testREDMetricsForClientHTTPLibrary)
+			t.Run("Harvested auto routes", testREDMetricsHTTPAutoRoutes)
+		})
+	}
+}
+
+func TestSuite_GoTraceFSUprobes(t *testing.T) {
+	compose, err := docker.ComposeSuite(
+		"docker-compose-go-tracefs-uprobes.yml",
+		path.Join(pathOutput, "test-suite-go-tracefs-uprobes.log"),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, compose.Close())
+	})
+	compose.Env = append(compose.Env, `OTEL_EBPF_EXECUTABLE_PATH=testserver`)
+	require.NoError(t, compose.Up())
+
+	t.Run("RED metrics", func(t *testing.T) {
+		waitForTestComponents(t, instrumentedServiceStdURL)
+		testREDMetricsForHTTPLibrary(t, instrumentedServiceStdURL, "testserver", "integration-test")
+	})
+}
+
+func TestSuiteNestedTraces(t *testing.T) {
+	// We run the test depending on what the host environment is. If the host is in lockdown mode integrity
+	// the nesting of spans will be limited. If we are in none (which should be in any non secure boot environment, e.g. Virtual Machines or CI)
+	// then we expect full nesting of trace spans in this test.
+
+	// Echo (server) -> echo (client) -> EchoBack (server)
+	lockdown := KernelLockdownMode()
+	compose, err := docker.ComposeSuite("docker-compose.yml", path.Join(pathOutput, "test-suite-nested.log"))
+	require.NoError(t, err)
+
+	if !lockdown {
+		compose.Env = append(compose.Env, `SECURITY_CONFIG_SUFFIX=_none`)
+		compose.Env = append(compose.Env, `OTEL_EBPF_BPF_CONTEXT_PROPAGATION=headers`)
+	}
+	require.NoError(t, compose.Up())
+	if !lockdown {
+		t.Run("HTTP traces (all spans nested)", testHTTPTracesNestedClientWithContextPropagation)
+		t.Run("HTTP traces (big header, all spans nested)", testHTTPTracesNestedBigHeader)
+		t.Run("HTTP -> gRPC traces (all spans nested)", testHTTP2GRPCTracesNestedCallsWithContextPropagation)
+	} else {
+		t.Run("HTTP traces (nested client span)", testHTTPTracesNestedClient)
+		t.Run("HTTP -> gRPC traces (nested client span)", testHTTP2GRPCTracesNestedCallsNoPropagation)
+	}
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuiteNestedTracesMaxTransactionTime(t *testing.T) {
+	// We run the test depending on what the host environment is. If the host is in lockdown mode integrity
+	// the nesting of spans will be limited. If we are in none (which should be in any non secure boot environment, e.g. Virtual Machines or CI)
+	// then we expect full nesting of trace spans in this test.
+
+	// Echo (server) -> delay (client) -> EchoBack (server)
+	lockdown := KernelLockdownMode()
+	compose, err := docker.ComposeSuite("docker-compose.yml", path.Join(pathOutput, "test-suite-nested-max-transaction-time.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_BPF_MAX_TRANSACTION_TIME=1ms`)
+
+	if !lockdown {
+		compose.Env = append(compose.Env, `SECURITY_CONFIG_SUFFIX=_none`)
+	}
+	require.NoError(t, compose.Up())
+	t.Run("HTTP traces not nested", testHTTPTracesNoNestedCalls)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuiteGoGeneric(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-go-generic.yml", path.Join(pathOutput, "test-suite-go-generic.log"))
+	require.NoError(t, err)
+	require.NoError(t, compose.Up())
+	t.Run("Generic Go HTTP/TCP traces (all spans nested)", testGoGenericHTTPTraces)
+	t.Run("Generic Go HTTPS/TCP(TLS) traces (all spans nested)", testGoGenericHTTPSTraces)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+// Alpine workload, so name resolution goes through musl's unconnected UDP socket
+func TestSuite_DNSUnconnectedResolver(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-dns-unconnected.yml", path.Join(pathOutput, "test-suite-dns-unconnected.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(
+		compose.Env,
+		`OTEL_EBPF_EXECUTABLE_PATH=python`,
+		`OTEL_EBPF_OPEN_PORT=`,
+		`INSTRUMENTER_CONFIG_SUFFIX=-dns`,
+	)
+	require.NoError(t, compose.Up())
+	t.Run("DNS RED metrics over an unconnected resolver socket", testDNSUnconnectedResolver)
+	t.Run("every DNS lookup is counted", testDNSEveryLookupCounted)
+	t.Run("non-DNS UDP is not reported as DNS", testDNSNoFalsePositive)
+	t.Run("unrelated traffic does not lose an outstanding lookup", testDNSInterleavedTraffic)
+	t.Run("DNS spans report every resolved address", testDNSSpanAnswers)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+// A JVM that cannot be attached to must not delay capture of its own traffic
+func TestSuite_JavaDiscoveryEarlyTraffic(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-java-discovery.yml", path.Join(pathOutput, "test-suite-java-discovery.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(
+		compose.Env,
+		`OTEL_EBPF_EXECUTABLE_PATH=java`,
+		`OTEL_EBPF_OPEN_PORT=`,
+	)
+	require.NoError(t, compose.Up())
+	t.Run("early JVM traffic is captured", testJavaDiscoveryEarlyTraffic)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuiteClientPromScrape(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-client.yml", path.Join(pathOutput, "test-suite-client-promscrape.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_EXECUTABLE_PATH=pingclient`)
+	compose.Env = append(compose.Env,
+		`INSTRUMENTER_CONFIG_SUFFIX=-promscrape`,
+		`PROM_CONFIG_SUFFIX=-promscrape`,
+	)
+	require.NoError(t, compose.Up())
+	t.Run("Client RED metrics", testREDMetricsForClientHTTPLibraryNoTraces)
+	t.Run("Testing OBI Build Info metric", testPrometheusOBIBuildInfo)
+
+	require.NoError(t, compose.Close())
+}
+
+// Same as Test suite, but the generated test image does not contain debug information
+func TestSuite_NoDebugInfo(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose.yml", path.Join(pathOutput, "test-suite-nodebug.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `TESTSERVER_DOCKERFILE_SUFFIX=_nodebug`)
+	require.NoError(t, compose.Up())
+
+	config := ti.DefaultOBIConfig()
+
+	t.Run("RED metrics", testREDMetricsHTTP)
+	t.Run("HTTP traces", testHTTPTraces)
+	t.Run("HTTP traces (url.query redaction)", testHTTPTracesURLQuery)
+	t.Run("HTTP traces (unknown method clamped to _OTHER)", testHTTPTracesUnknownMethod)
+	t.Run("GRPC traces", testGRPCTraces)
+	t.Run("GRPC RED metrics", testREDMetricsGRPC)
+	t.Run("Internal Prometheus metrics", func(t *testing.T) { ti.InternalPrometheusExport(t, config) })
+
+	runWeaverValidation(t)
+
+	require.NoError(t, compose.Close())
+}
+
+// Same as Test suite, but the generated test image does not contain debug information
+func TestSuite_StaticCompilation(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose.yml", path.Join(pathOutput, "test-suite-static.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `TESTSERVER_DOCKERFILE_SUFFIX=_static`)
+	require.NoError(t, compose.Up())
+
+	config := ti.DefaultOBIConfig()
+
+	t.Run("RED metrics", testREDMetricsHTTP)
+	t.Run("HTTP traces", testHTTPTraces)
+	t.Run("GRPC traces", testGRPCTraces)
+	t.Run("GRPC RED metrics", testREDMetricsGRPC)
+	t.Run("Internal Prometheus metrics", func(t *testing.T) { ti.InternalPrometheusExport(t, config) })
+
+	runWeaverValidation(t)
+
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_OldestGoVersion(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-1.17.yml", path.Join(pathOutput, "test-suite-oldest-go.log"))
+	require.NoError(t, err)
+	compose.Env = append(compose.Env, `OTEL_GO_AUTO_TARGET_EXE=*testserver`, `PROM_CONFIG_SUFFIX=`)
+	require.NoError(t, compose.Up())
+
+	config := ti.DefaultOBIConfig()
+
+	t.Run("RED metrics", testREDMetricsOldHTTP)
+	t.Run("HTTP traces", testHTTPTraces)
+	t.Run("GRPC traces", testGRPCTraces)
+	t.Run("GRPC RED metrics", testREDMetricsGRPC)
+	t.Run("HTTP traces (manual spans)", testHTTPTracesNestedManualSpans)
+	t.Run("Internal Prometheus metrics", func(t *testing.T) { ti.InternalPrometheusExport(t, config) })
+
+	runWeaverValidation(t)
+
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_SkipGoTracers(t *testing.T) {
+	t.Skip("seems flaky, we need to look into this")
+	compose, err := docker.ComposeSuite("docker-compose.yml", path.Join(pathOutput, "test-suite-skip-go-tracers.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_SKIP_GO_SPECIFIC_TRACERS=1`)
+	require.NoError(t, compose.Up())
+	t.Run("RED metrics", testREDMetricsShortHTTP)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_GRPCExport(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose.yml", path.Join(pathOutput, "test-suite-grpc-export.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, "INSTRUMENTER_CONFIG_SUFFIX=-grpc-export")
+	require.NoError(t, compose.Up())
+	t.Run("RED metrics", testREDMetricsHTTP)
+	t.Run("trace HTTP service and export as GRPC traces", testHTTPTraces)
+	t.Run("trace GRPC service and export as GRPC traces", testGRPCTraces)
+	t.Run("GRPC RED metrics", testREDMetricsGRPC)
+
+	runWeaverValidation(t)
+
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_GRPCExportKProbes(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose.yml", path.Join(pathOutput, "test-suite-grpc-export-kprobes.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, "INSTRUMENTER_CONFIG_SUFFIX=-grpc-export")
+	compose.Env = append(compose.Env, `OTEL_EBPF_SKIP_GO_SPECIFIC_TRACERS=1`)
+	require.NoError(t, compose.Up())
+
+	waitForTestComponents(t, instrumentedServiceStdURL)
+
+	t.Run("trace GRPC service and export as GRPC traces - kprobes", testGRPCKProbeTraces)
+	t.Run("GRPC RED metrics - kprobes", testREDMetricsGRPC)
+
+	runWeaverValidation(t)
+
+	require.NoError(t, compose.Close())
+}
+
+// Instead of submitting metrics via OTEL, exposes them as an obi:8999/metrics endpoint
+// that is scraped by the Prometheus server
+func TestSuite_PrometheusScrape(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose.yml", path.Join(pathOutput, "test-suite-promscrape.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env,
+		`INSTRUMENTER_CONFIG_SUFFIX=-promscrape`,
+		`PROM_CONFIG_SUFFIX=-promscrape`,
+		`OTEL_EBPF_EXECUTABLE_PATH=`,
+		`OTEL_EBPF_OPEN_PORT=8082,8999`, // force OBI self-instrumentation to ensure we don't do it
+	)
+
+	require.NoError(t, compose.Up())
+
+	config := ti.DefaultOBIConfig()
+
+	t.Run("RED metrics", testREDMetricsHTTP)
+	t.Run("GRPC RED metrics", testREDMetricsGRPC)
+	t.Run("Exemplars exist", testExemplarsExist)
+	t.Run("Internal Prometheus metrics", func(t *testing.T) { ti.InternalPrometheusExport(t, config) })
+	t.Run("Testing OBI Build Info metric", testPrometheusOBIBuildInfo)
+	t.Run("Testing for no OBI self metrics", testPrometheusNoOBIEvents)
+	t.Run("Testing BPF metrics", testPrometheusBPFMetrics)
+
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_Java(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-java.yml", path.Join(pathOutput, "test-suite-java.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `TESTSERVER_IMAGE=`+obiTestImgJavaNative)
+	require.NoError(t, compose.Up())
+	t.Run("Java RED metrics", func(t *testing.T) { testREDMetricsJavaHTTP(t, "greeting") })
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+// Same as TestSuite_Java but we run in the process namespace and it uses process namespace filtering
+func TestSuite_Java_PID(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-java-pid.yml", path.Join(pathOutput, "test-suite-java-pid.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `JAVA_OPEN_PORT=8085`, `JAVA_EXECUTABLE_PATH=`, `TESTSERVER_IMAGE=`+obiTestImgJavaJar)
+	require.NoError(t, compose.Up())
+	t.Run("Java RED metrics", func(t *testing.T) { testREDMetricsJavaHTTP(t, "greeting-service") })
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+// Same as Java Test suite, but searching the executable by port instead of executable name. We also run the jar version of Java instead of native image
+func TestSuite_Java_OpenPort(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-java.yml", path.Join(pathOutput, "test-suite-java-openport.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `JAVA_EXECUTABLE_PATH=`, `TESTSERVER_IMAGE=`+obiTestImgJavaJar)
+	require.NoError(t, compose.Up())
+	t.Run("Java RED metrics", func(t *testing.T) { testREDMetricsJavaHTTP(t, "greeting-service") })
+
+	runWeaverValidation(t)
+
+	require.NoError(t, compose.Close())
+}
+
+// Test that we can also instrument when running with host network mode
+func TestSuite_Java_Host_Network(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-java-host.yml", path.Join(pathOutput, "test-suite-java-host-network.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `TESTSERVER_IMAGE=`+obiTestImgJavaNative)
+	require.NoError(t, compose.Up())
+	t.Run("Java RED metrics", func(t *testing.T) { testREDMetricsJavaHTTP(t, "greeting") })
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_Rust(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-rust.yml", path.Join(pathOutput, "test-suite-rust.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8090`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8091:8090`, `TESTSERVER_IMAGE=`+obiTestImgRust)
+	require.NoError(t, compose.Up())
+	t.Run("Rust RED metrics", testREDMetricsRustHTTP)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_RustSSL(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-rust.yml", path.Join(pathOutput, "test-suite-rust-tls.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8490`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8491:8490`, `TESTSERVER_IMAGE=`+obiTestImgRustSSL)
+	require.NoError(t, compose.Up())
+	t.Run("Rust RED metrics", testREDMetricsRustHTTPS)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+// The actix server that we built our Rust example will enable HTTP2 for SSL automatically if the client supports it.
+// We use this feature to implement our kprobes HTTP2 tests, with special http client settings that triggers the Go
+// client to attempt http connection.
+func TestSuite_RustHTTP2(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-rust.yml", path.Join(pathOutput, "test-suite-rust-http2.log"))
+	require.NoError(t, err)
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8490`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8491:8490`, `TESTSERVER_IMAGE=`+obiTestImgRustSSL)
+
+	require.NoError(t, compose.Up())
+	t.Run("Rust RED metrics", testREDMetricsRustHTTP2)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_NodeJS(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-nodejs.yml", path.Join(pathOutput, "test-suite-nodejs.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=3030`, `OTEL_EBPF_EXECUTABLE_PATH=`, `NODE_APP=app`)
+	require.NoError(t, compose.Up())
+	t.Run("NodeJS RED metrics", func(t *testing.T) { testREDMetricsJSHTTP(t, "testserver") })
+	t.Run("HTTP traces (kprobes)", func(t *testing.T) { testHTTPTracesKProbes(t, "testserver", true, "nodejs") })
+	t.Run("HTTP nested traces large HTTPS (kprobes)", testHTTPTracesNestedJSLargeHTTPS)
+	t.Run("HTTP manual spans (OTel API bridge)", testHTTPTracesNodeManualSpans)
+	t.Run("HTTP manual spans (background span isolation)", testHTTPTracesNodeManualBackgroundSpan)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+// With context propagation on, the outgoing call's parent is resolved by the
+// tpinjector rather than by the generic tracer, so manual-span nesting runs
+// through a different helper. Same assertions, second code path.
+func TestSuite_NodeJSManualSpansPropagation(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-nodejs-manual-prop.yml",
+		path.Join(pathOutput, "test-suite-nodejs-manual-prop.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=3030`, `OTEL_EBPF_EXECUTABLE_PATH=`, `NODE_APP=app`)
+	require.NoError(t, compose.Up())
+	waitForTestComponents(t, "http://localhost:3031")
+	t.Run("HTTP manual spans (OTel API bridge)", testHTTPTracesNodeManualSpans)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_Deno(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-deno.yml", path.Join(pathOutput, "test-suite-deno.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=3030`, `OTEL_EBPF_EXECUTABLE_PATH=`, `MAIN_FILE=app.js`)
+	require.NoError(t, compose.Up())
+	t.Run("Deno RED metrics", func(t *testing.T) { testREDMetricsJSHTTP(t, "denoserver") })
+	t.Run("HTTP traces (kprobes)", func(t *testing.T) { testHTTPTracesKProbes(t, "denoserver", false, "deno-rust") })
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_NodeJSTLS(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-nodejs.yml", path.Join(pathOutput, "test-suite-nodejs-tls.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=3033`, `OTEL_EBPF_EXECUTABLE_PATH=`, `NODE_APP=app_tls`)
+	require.NoError(t, compose.Up())
+	t.Run("NodeJS SSL RED metrics", testREDMetricsNodeJSHTTPS)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_Rails(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-ruby.yml", path.Join(pathOutput, "test-suite-ruby.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=3040,443`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=3041:3040`, `TESTSERVER_IMAGE=`+obiTestImgRails)
+	require.NoError(t, compose.Up())
+	t.Run("Rails RED metrics", func(t *testing.T) { testREDMetricsRailsHTTP(t, "testapi") })
+	t.Run("Rails harvested routes", func(t *testing.T) { testRailsHarvestedRoutes(t, "testapi") })
+	t.Run("Rails NGINX traces", testHTTPTracesNestedNginx)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_RailsNginxSupportFloor(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-ruby.yml", path.Join(pathOutput, "test-suite-ruby-nginx-floor.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(
+		compose.Env,
+		`OTEL_EBPF_OPEN_PORT=3040,443`,
+		`OTEL_EBPF_EXECUTABLE_PATH=`,
+		`TEST_SERVICE_PORTS=3041:3040`,
+		`NGINX_IMAGE=`+nginxReverseProxySupportFloorImage,
+		`TESTSERVER_IMAGE=`+obiTestImgRails,
+	)
+	require.NoError(t, compose.Up())
+
+	t.Run("Rails RED metrics", func(t *testing.T) { testREDMetricsRailsHTTP(t, "testapi") })
+	t.Run("Rails NGINX traces", testHTTPTracesNestedNginx)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_RailsRuby302Puma5(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-ruby-3.0.2-puma5.yml", path.Join(pathOutput, "test-suite-ruby-3.0.2-puma5.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=3040,443`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=3041:3040`)
+	require.NoError(t, compose.Up())
+	t.Run("Rails RED metrics", func(t *testing.T) { testREDMetricsRailsHTTP(t, "my-ruby-app") })
+	t.Run("Rails NGINX traces", testHTTPTracesNestedNginx)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_RailsNginxSQL(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-ruby-nginx-sql.yml", path.Join(pathOutput, "test-suite-ruby-nginx-sql.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=3040,443`, `OTEL_EBPF_EXECUTABLE_PATH=`)
+	require.NoError(t, compose.Up())
+	t.Run("Rails RED metrics", func(t *testing.T) { testREDMetricsRailsHTTP(t, "my-ruby-app") })
+	t.Run("Rails NGINX SQL traces nested", testHTTPTracesNestedNginxSQL)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_RailsRuby4Postgres(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-ruby-postgres.yml", path.Join(pathOutput, "test-suite-ruby-postgres.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=3040`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=3041:3040`)
+	require.NoError(t, compose.Up())
+	t.Run("Rails PostgreSQL traces", testHTTPTracesRailsPostgres)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_RailsTLS(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-ruby.yml", path.Join(pathOutput, "test-suite-ruby-tls.log"))
+	require.NoError(t, err)
+
+	// TODO: remove TESTSERVER_DOCKERFILE_SUFFIX once docker-compose-ruby.yml uses again an "image" clause
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=3043`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TESTSERVER_IMAGE=`+obiTestImgRailsSSL, `TEST_SERVICE_PORTS=3044:3043`,
+		`TESTSERVER_DOCKERFILE_SUFFIX=_tls`)
+	require.NoError(t, compose.Up())
+	t.Run("Rails SSL RED metrics", func(t *testing.T) { testREDMetricsRailsHTTPS(t, "testapi") })
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_DotNet(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-dotnet.yml", path.Join(pathOutput, "test-suite-dotnet.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=5266`, `OTEL_EBPF_EXECUTABLE_PATH=`)
+	require.NoError(t, compose.Up())
+	t.Run("DotNet RED metrics", testREDMetricsDotNetHTTP)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+// Disabled for now as we randomly fail to register 3 events, but only get 2
+// Issue: https://github.com/grafana/beyla/issues/208
+func TestSuite_DotNetTLS(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-dotnet.yml", path.Join(pathOutput, "test-suite-dotnet-tls.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=7033`, `OTEL_EBPF_EXECUTABLE_PATH=`)
+	// Add these above if you want to get the trace_pipe output in the test logs: `INSTRUMENT_DOCKERFILE_SUFFIX=_dbg`, `INSTRUMENT_COMMAND_SUFFIX=_wrapper.sh`
+	require.NoError(t, compose.Up())
+	t.Run("DotNet SSL RED metrics", testREDMetricsDotNetHTTPS)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_Python(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python.yml", path.Join(pathOutput, "test-suite-python.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(
+		compose.Env,
+		`OTEL_EBPF_OPEN_PORT=8380`,
+		`OTEL_EBPF_EXECUTABLE_PATH=`,
+		`TEST_SERVICE_PORTS=8381:8380`,
+		`INSTRUMENTER_CONFIG_SUFFIX=-java`,
+	)
+	require.NoError(t, compose.Up())
+	t.Run("Python RED metrics", testREDMetricsPythonHTTP)
+	t.Run("Python RED metrics with timeouts", testREDMetricsTimeoutPythonHTTP)
+	t.Run("Python DNS RED metrics", testREDMetricsDNSPython)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_PythonProm(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python.yml", path.Join(pathOutput, "test-suite-python-prom.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(
+		compose.Env,
+		`OTEL_EBPF_OPEN_PORT=8380`,
+		`OTEL_EBPF_EXECUTABLE_PATH=`,
+		`TEST_SERVICE_PORTS=8381:8380`,
+		`INSTRUMENTER_CONFIG_SUFFIX=-promscrape`,
+	)
+	require.NoError(t, compose.Up())
+	t.Run("Python RED metrics", testREDMetricsPythonHTTP)
+	t.Run("Python RED metrics with timeouts", testREDMetricsTimeoutPythonHTTP)
+	t.Run("Python DNS RED metrics", testREDMetricsDNSPython)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_PythonPostgres(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-postgresql.yml", path.Join(pathOutput, "test-suite-python-postgresql.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`)
+	require.NoError(t, compose.Up())
+	t.Run("Python Postgres tests", testPythonPostgres)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_PythonPostgresAfterHeaders(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-postgresql-after-headers.yml", path.Join(pathOutput, "test-suite-python-postgresql-after-headers.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`)
+	require.NoError(t, compose.Up())
+	t.Run("Python Postgres after headers", func(t *testing.T) {
+		testPythonPostgresAfterHeaders(t, "http://localhost:8381")
+	})
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_PythonPostgresAfterHeadersHighRequestVolume(t *testing.T) {
+	compose, err := docker.ComposeSuite(
+		"docker-compose-python-postgresql-after-headers.yml",
+		path.Join(pathOutput, "test-suite-python-postgresql-after-headers-high-request-volume.log"),
+	)
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env,
+		`OTEL_EBPF_OPEN_PORT=8080`,
+		`OTEL_EBPF_EXECUTABLE_PATH=`,
+		`OTEL_EBPF_BPF_HIGH_REQUEST_VOLUME=true`,
+		`TEST_SERVICE_PORTS=8381:8080`,
+	)
+	require.NoError(t, compose.Up())
+	t.Run("Python Postgres after headers with high request volume", func(t *testing.T) {
+		testPythonPostgresAfterHeaders(t, "http://localhost:8381")
+	})
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_PythonPostgresAfterHeadersTLS(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-postgresql-after-headers.yml", path.Join(pathOutput, "test-suite-python-postgresql-after-headers-tls.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env,
+		`OTEL_EBPF_OPEN_PORT=8080`,
+		`OTEL_EBPF_EXECUTABLE_PATH=`,
+		`TEST_SERVICE_PORTS=8381:8080`,
+		`PYTHON_SQL_TLS=true`,
+	)
+	require.NoError(t, compose.Up())
+	t.Run("Python Postgres after TLS headers", func(t *testing.T) {
+		testPythonPostgresAfterHeaders(t, "https://localhost:8381")
+	})
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_PythonMySQL(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-mysql.yml", path.Join(pathOutput, "test-suite-python-mysql.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`)
+	require.NoError(t, compose.Up())
+	t.Run("Python MySQL tests", testPythonMySQL)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_PythonMSSQL(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-mssql.yml", path.Join(pathOutput, "test-suite-python-mssql.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`)
+	require.NoError(t, compose.Up())
+	t.Run("Python MSSQL tests", testPythonMSSQL)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_PythonKafka(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-kafka.yml", path.Join(pathOutput, "test-suite-python-kafka.log"))
+	require.NoError(t, err)
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`)
+	require.NoError(t, compose.Up())
+	t.Run("Python Kafka tests", testREDMetricsPythonKafkaOnly)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_GoKafkaTraceparent(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-go-kafka-traceparent.yml", path.Join(pathOutput, "test-suite-go-kafka-traceparent.log"))
+	require.NoError(t, err)
+	// Discover by executable name: the Kafka broker and Zookeeper are Java processes
+	// (Zookeeper's admin server also listens on 8080), so port-based discovery is
+	// ambiguous under pid:host. Match only the Go "testserver" binary.
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=`, `OTEL_EBPF_EXECUTABLE_PATH=testserver`, `TEST_SERVICE_PORTS=8389:8080`)
+	require.NoError(t, compose.Up())
+	t.Run("Go Kafka stale traceparent contamination (#2046)", testGoKafkaTraceparent)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_PythonMQTT(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-mqtt.yml", path.Join(pathOutput, "test-suite-python-mqtt.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`)
+	require.NoError(t, compose.Up())
+	t.Run("Python MQTT publish tests", testREDMetricsPythonMQTT)
+	t.Run("Python MQTT subscribe tests", testREDMetricsPythonMQTTSubscribe)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_GoMQTT(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-go-mqtt.yml", path.Join(pathOutput, "test-suite-go-mqtt.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`)
+	require.NoError(t, compose.Up())
+	t.Run("Go MQTT publish tests", testREDMetricsGoMQTT)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_GoSunRPC(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-go-sunrpc.yml", path.Join(pathOutput, "test-suite-go-sunrpc.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`)
+	require.NoError(t, compose.Up())
+	t.Run("Go SunRPC tests", testREDMetricsGoSunRPC)
+	t.Run("Go SunRPC Prometheus metrics", testREDMetricsGoSunRPCPrometheus)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_JavaKafka(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-java-kafka-400.yml", path.Join(pathOutput, "test-suite-java-kafka.log"))
+	require.NoError(t, err)
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`)
+	require.NoError(t, compose.Up())
+	t.Run("Java Kafka 4.0.0 tests", func(t *testing.T) { testJavaKafka(t, 9092, "javakafka") })
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_JavaKafkaTLS(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-java-kafka-400-tls.yml", path.Join(pathOutput, "test-suite-java-kafka.log"))
+	require.NoError(t, err)
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`)
+	require.NoError(t, compose.Up())
+	t.Run("Java Kafka 4.0.0 tests", func(t *testing.T) { testJavaKafka(t, 9094, "javakafka-1.0.0") })
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_JavaKafkaLargeBuffer(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-java-kafka-400-lb.yml", path.Join(pathOutput, "test-suite-java-kafka-lb.log"))
+	require.NoError(t, err)
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`)
+	require.NoError(t, compose.Up())
+	t.Run("Java Kafka 4.0.0 large buffer tests", testJavaKafkaLargeBuffer)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_NodeRdkafka(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-node-rdkafka.yml", path.Join(pathOutput, "test-suite-node-rdkafka.log"))
+	require.NoError(t, err)
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`)
+	require.NoError(t, compose.Up())
+	t.Run("Node librdkafka topic resolution", testNodeRdkafka)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_JavaKafkaMultiTopic(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-java-kafka-multitopic.yml", path.Join(pathOutput, "test-suite-java-kafka-multitopic.log"))
+	require.NoError(t, err)
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`)
+	require.NoError(t, compose.Up())
+	t.Run("Java Kafka multi-topic metadata resolution", testJavaKafkaMultiTopic)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_PythonAsyncUvloop_3_9(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-async-uvloop-3.9.yml", path.Join(pathOutput, "test-suite-python-async-uvloop-3_9.log"))
+	require.NoError(t, err)
+	require.NoError(t, compose.Up())
+
+	t.Run("Sequential", testPythonAsyncSequential)
+	t.Run("Concurrent", testPythonAsyncConcurrent)
+	t.Run("To Thread", testPythonAsyncToThread)
+	t.Run("Cancelled To Thread", testPythonAsyncCancelledToThread)
+	t.Run("Nested", testPythonAsyncNested)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_PythonAsyncUvloop_3_14(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-async-uvloop-3.14.yml", path.Join(pathOutput, "test-suite-python-async-uvloop-3_14.log"))
+	require.NoError(t, err)
+	require.NoError(t, compose.Up())
+
+	t.Run("Sequential", testPythonAsyncSequential)
+	t.Run("Concurrent", testPythonAsyncConcurrent)
+	t.Run("To Thread", testPythonAsyncToThread)
+	t.Run("Nested", testPythonAsyncNested)
+	t.Run("Keep-Alive", testPythonAsyncKeepAlive)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+// Uvicorn on the standard asyncio event loop (uvloop replaced via UVICORN_LOOP)
+func TestSuite_PythonAsyncUvicornAsyncio_3_14(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-async-uvloop-3.14.yml", path.Join(pathOutput, "test-suite-python-async-uvicorn-asyncio-3_14.log"))
+	require.NoError(t, err)
+	compose.Env = append(compose.Env, `UVICORN_LOOP=asyncio`)
+	require.NoError(t, compose.Up())
+
+	t.Run("Sequential", testPythonAsyncSequential)
+	t.Run("Concurrent", testPythonAsyncConcurrent)
+	t.Run("To Thread", testPythonAsyncToThread)
+	t.Run("Nested", testPythonAsyncNested)
+	t.Run("Keep-Alive", testPythonAsyncKeepAlive)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_PythonAsyncGeneric_3_9(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-async-generic-3.9.yml", path.Join(pathOutput, "test-suite-python-async-generic-3_9.log"))
+	require.NoError(t, err)
+	require.NoError(t, compose.Up())
+
+	t.Run("Sequential", testPythonAsyncGenericSequential)
+	t.Run("Concurrent", testPythonAsyncGenericConcurrent)
+	t.Run("To Thread", testPythonAsyncGenericToThread)
+	t.Run("Cancelled To Thread", testPythonAsyncGenericCancelledToThread)
+	t.Run("Nested", testPythonAsyncGenericNested)
+	t.Run("Keep-Alive", testPythonAsyncGenericKeepAlive)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_PythonAsyncGeneric_3_14(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-async-generic-3.14.yml", path.Join(pathOutput, "test-suite-python-async-generic-3_14.log"))
+	require.NoError(t, err)
+	require.NoError(t, compose.Up())
+
+	t.Run("Sequential", testPythonAsyncGenericSequential)
+	t.Run("Concurrent", testPythonAsyncGenericConcurrent)
+	t.Run("To Thread", testPythonAsyncGenericToThread)
+	t.Run("Nested", testPythonAsyncGenericNested)
+	t.Run("Keep-Alive", testPythonAsyncGenericKeepAlive)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_PythonRedis(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-redis.yml", path.Join(pathOutput, "test-suite-python-redis.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`)
+	require.NoError(t, compose.Up())
+	t.Run("Python Redis metrics", testREDMetricsPythonRedisOnly)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_PythonRedisPipeline(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-redis-pipeline.yml", path.Join(pathOutput, "test-suite-python-redis-pipeline.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`)
+	require.NoError(t, compose.Up())
+	t.Run("Redis pipeline traces", testTracesRedisPipeline)
+	t.Run("Redis pipeline traces without a parent", testTracesRedisPipelineNoParent)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_PythonRedisServerSide(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-redis-server.yml", path.Join(pathOutput, "test-suite-python-redis-server.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=6379`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`)
+	require.NoError(t, compose.Up())
+	t.Run("Redis server-side metrics", func(t *testing.T) {
+		waitForRedisServerTestComponents(t, "http://localhost:8381", "/redis")
+		testREDMetricsRedisServerSide(t)
+	})
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_NodeBullMQ(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-nodejs-bullmq.yml", path.Join(pathOutput, "test-suite-nodejs-bullmq.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=3040`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8382:3040`)
+	require.NoError(t, compose.Up())
+	t.Run("Node BullMQ blocking Redis worker", func(t *testing.T) {
+		waitForBullMQTestComponents(t, "http://localhost:8382")
+		testREDMetricsNodeBullMQ(t)
+	})
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_Aerospike(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-aerospike.yml", path.Join(pathOutput, "test-suite-aerospike.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8390:8080`)
+	require.NoError(t, compose.Up())
+	t.Run("Aerospike RED metrics and traces", testREDMetricsAerospikeOnly)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_AerospikeServerSide(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-aerospike-server.yml", path.Join(pathOutput, "test-suite-aerospike-server.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=3000`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8392:8080`)
+	require.NoError(t, compose.Up())
+	t.Run("Aerospike server-side traces", func(t *testing.T) {
+		waitForAerospikeServerTestComponents(t, "http://localhost:8392")
+		testREDTracesAerospikeServerSide(t)
+	})
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_PythonMongo(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-mongo.yml", path.Join(pathOutput, "test-suite-python-mongo.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`)
+	require.NoError(t, compose.Up())
+	t.Run("Python Mongo metrics", testREDMetricsPythonMongoOnly)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+// mongo shares the client's network namespace, so the client sees a local
+// listener on the server port
+func TestSuite_PythonMongoSameNetNS(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-mongo-samenet.yml", path.Join(pathOutput, "test-suite-python-mongo-samenet.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`)
+	require.NoError(t, compose.Up())
+	t.Run("Python Mongo same-netns metrics", testREDMetricsPythonMongoOnly)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_PythonCouchbase(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-couchbase.yml", path.Join(pathOutput, "test-suite-python-couchbase.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`)
+	require.NoError(t, compose.Up())
+	t.Run("Python Couchbase metrics", testREDMetricsPythonCouchbaseOnly)
+	t.Run("Python Couchbase default collection", testREDMetricsPythonCouchbaseDefaultCollection)
+	t.Run("Python Couchbase error", testREDMetricsPythonCouchbaseError)
+	t.Run("Python Couchbase SQL++ metrics", testREDMetricsPythonCouchbaseSQLPP)
+	t.Run("Python Couchbase SQL++ with context", testREDMetricsPythonCouchbaseSQLPPWithContext)
+	t.Run("Python Couchbase SQL++ error", testREDMetricsPythonCouchbaseSQLPPError)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_PythonSQLSSL(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-sql-ssl.yml", path.Join(pathOutput, "test-suite-python-sql-ssl.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`)
+	require.NoError(t, compose.Up())
+	t.Run("Python SQL metrics", testREDMetricsPythonSQLSSL)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_PythonTLS(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python.yml", path.Join(pathOutput, "test-suite-python-tls.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(
+		compose.Env,
+		`OTEL_EBPF_OPEN_PORT=8380`,
+		`OTEL_EBPF_EXECUTABLE_PATH=`,
+		`TEST_SERVICE_PORTS=8381:8380`,
+		`TESTSERVER_DOCKERFILE_SUFFIX=_tls`,
+		`INSTRUMENTER_CONFIG_SUFFIX=-java`,
+	)
+	require.NoError(t, compose.Up())
+	t.Run("Python SSL RED metrics", testREDMetricsPythonHTTPS)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_PythonSelfReference(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-self.yml", path.Join(pathOutput, "test-suite-python-self.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=7771`, `OTEL_EBPF_EXECUTABLE_PATH=`)
+	require.NoError(t, compose.Up())
+	t.Run("Python Traces with self-references", testHTTPTracesNestedSelfCalls)
+	t.Run("Python Traces transaction too long", testHTTPTracesNestedCallsTooLong)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_PythonGraphQL(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-graphql.yml", path.Join(pathOutput, "test-suite-python-graphql.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`)
+	require.NoError(t, compose.Up())
+	t.Run("Python GraphQL", testPythonGraphQL)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_PythonJsonRPC(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-jsonrpc.yml", path.Join(pathOutput, "test-suite-python-jsonrpc.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`)
+	require.NoError(t, compose.Up())
+	t.Run("Python JSON-RPC server span", testPythonJSONRPCServer)
+	t.Run("Python JSON-RPC RPC metrics", testPythonJSONRPCMetrics)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_PythonMCP(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-mcp.yml", path.Join(pathOutput, "test-suite-python-mcp.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`)
+	require.NoError(t, compose.Up())
+	t.Run("Python MCP server span", testPythonMCPServer)
+	t.Run("Python MCP initialize", testPythonMCPInitialize)
+	t.Run("Python MCP client span", testPythonMCPClient)
+	t.Run("Python MCP client resource span", testPythonMCPClientResource)
+	t.Run("Python MCP operation metrics", testPythonMCPMetrics)
+	t.Run("Python MCP session metrics", testPythonMCPSessionMetrics)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_PythonElasticsearch(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-elasticsearch.yml", path.Join(pathOutput, "test-suite-elasticsearch.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`)
+	require.NoError(t, compose.Up())
+	t.Run("Python Elasticsearch", func(t *testing.T) {
+		testPythonElasticsearch(t, "elasticsearch")
+	})
+	t.Run("Python Opensearch", func(t *testing.T) {
+		testPythonElasticsearch(t, "opensearch")
+	})
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_PythonAWSS3(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-aws.yml", path.Join(pathOutput, "test-suite-python-aws-s3.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`)
+	require.NoError(t, compose.Up())
+	t.Run("Python AWS S3", testPythonAWSS3)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_PythonAWSSQS(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-aws.yml", path.Join(pathOutput, "test-suite-python-aws-sqs.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`)
+	require.NoError(t, compose.Up())
+	t.Run("Python AWS SQS", testPythonAWSSQS)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_PythonAWSSNS(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-aws.yml", path.Join(pathOutput, "test-suite-python-aws-sns.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`)
+	require.NoError(t, compose.Up())
+	t.Cleanup(func() { require.NoError(t, compose.Close()) })
+	t.Cleanup(func() { runWeaverValidation(t) })
+	t.Run("Python AWS SNS", testPythonAWSSNS)
+}
+
+func TestSuite_NodeJSDist(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-nodejs-dist.yml", path.Join(pathOutput, "test-suite-nodejs-dist.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=`, `OTEL_EBPF_EXECUTABLE_PATH=`)
+	require.NoError(t, compose.Up())
+	t.Run("NodeJS Distributed Traces with multiple chained calls", testHTTPTracesNestedNodeJSDistCalls)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_DisableKeepAlives(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose.yml", path.Join(pathOutput, "test-suite-disablekeepalives.log"))
+	require.NoError(t, err)
+	require.NoError(t, compose.Up())
+
+	config := ti.DefaultOBIConfig()
+
+	// Run tests with keepalives disabled:
+	setHTTPClientDisableKeepAlives(true)
+	t.Run("RED metrics", testREDMetricsHTTP)
+
+	t.Run("HTTP DisableKeepAlives traces", testHTTPTraces)
+	t.Run("Internal Prometheus DisableKeepAlives metrics", func(t *testing.T) { ti.InternalPrometheusExport(t, config) })
+	// Reset to defaults for any tests run afterward
+	setHTTPClientDisableKeepAlives(false)
+
+	runWeaverValidation(t)
+
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_OverrideServiceName(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose.yml", path.Join(pathOutput, "test-suite-override-svcname.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, "INSTRUMENTER_CONFIG_SUFFIX=-override-svcname")
+	require.NoError(t, compose.Up())
+
+	// Just few simple test cases to verify that the tracers properly override the service name
+	// according to the configuration
+	t.Run("RED metrics", func(t *testing.T) {
+		waitForTestComponents(t, instrumentedServiceStdURL)
+		testREDMetricsForHTTPLibrary(t, instrumentedServiceStdURL, "overridden-svc-name", "integration-test")
+	})
+	t.Run("GRPC traces", func(t *testing.T) {
+		testGRPCTracesForServiceName(t, "overridden-svc-name")
+	})
+
+	runWeaverValidation(t)
+
+	require.NoError(t, compose.Close())
+}
+
+func TestSuiteNodeClient(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-nodeclient.yml", path.Join(pathOutput, "test-suite-nodeclient.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_EXECUTABLE_PATH=node`, `NODE_APP=client`, `PROM_CONFIG_SUFFIX=`)
+	require.NoError(t, compose.Up())
+	t.Run("Node Client RED metrics", func(t *testing.T) {
+		testNodeClientWithMethodAndStatusCode(t, "GET", 301, 80, "0000000000000000", "client")
+	})
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuiteNodeClientTLS(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-nodeclient.yml", path.Join(pathOutput, "test-suite-nodeclient-tls.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_EXECUTABLE_PATH=node`, `NODE_APP=client_tls`, `PROM_CONFIG_SUFFIX=`)
+	require.NoError(t, compose.Up())
+	t.Run("Node Client RED metrics", func(t *testing.T) {
+		testNodeClientWithMethodAndStatusCode(t, "GET", 200, 443, "0000000000000001", "client_tls")
+	})
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+// TestSuitePythonAsyncMemoryBIOTLSClient covers a client span's peer for CPython's
+// asyncio, whose TLS goes through ssl.MemoryBIO: the ciphertext is written to the
+// socket by the event loop once SSL_write has returned, so the SSL has to be
+// correlated to its connection by the ciphertext it produced.
+func TestSuitePythonAsyncMemoryBIOTLSClient(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-memorybio-tls.yml", path.Join(pathOutput, "test-suite-memorybio-tls-python.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env,
+		`OTEL_EBPF_EXECUTABLE_PATH=python`,
+		`INSTRUMENTER_CONFIG_SUFFIX=-memorybio-tls`,
+		`MEMORYBIO_DOCKERFILE=internal/test/integration/components/memorybio/Dockerfile_python`,
+		`MEMORYBIO_IMAGE=hatest-memorybio-python`,
+		`PROM_CONFIG_SUFFIX=`)
+	require.NoError(t, compose.Up())
+	t.Run("asyncio memory-BIO TLS client peer", testMemoryBIOTLSClientPeer)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+// TestSuiteNodeMemoryBIOTLSClient is the same check for Node.js, whose TLSWrap is a
+// memory BIO as well.
+func TestSuiteNodeMemoryBIOTLSClient(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-memorybio-tls.yml", path.Join(pathOutput, "test-suite-memorybio-tls-node.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env,
+		`OTEL_EBPF_EXECUTABLE_PATH=node`,
+		`INSTRUMENTER_CONFIG_SUFFIX=-memorybio-tls`,
+		`MEMORYBIO_DOCKERFILE=internal/test/integration/components/memorybio/Dockerfile_node`,
+		`MEMORYBIO_IMAGE=hatest-memorybio-node`,
+		`PROM_CONFIG_SUFFIX=`)
+	require.NoError(t, compose.Up())
+	t.Run("Node memory-BIO TLS client peer", testMemoryBIOTLSClientPeer)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+// TestSuiteNodeMemoryBIOTLSClientContextPropagation is the same check with a sock_msg
+// program attached, which is a different code path rather than a different setting:
+// the send data lives in bvec pages, so tcp_sendmsg reads nothing from the msghdr and
+// the ciphertext reaches the correlation only through the sock_msg buffer. Node stands
+// in for both runtimes here, since the paths under test are the kernel's rather than
+// the TLS stack's.
+func TestSuiteNodeMemoryBIOTLSClientContextPropagation(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-memorybio-tls.yml", path.Join(pathOutput, "test-suite-memorybio-tls-node-cp.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env,
+		`OTEL_EBPF_EXECUTABLE_PATH=node`,
+		`INSTRUMENTER_CONFIG_SUFFIX=-memorybio-tls-cp`,
+		`MEMORYBIO_DOCKERFILE=internal/test/integration/components/memorybio/Dockerfile_node`,
+		`MEMORYBIO_IMAGE=hatest-memorybio-node`,
+		`PROM_CONFIG_SUFFIX=`)
+	require.NoError(t, compose.Up())
+	t.Run("Node memory-BIO TLS client peer under context propagation", testMemoryBIOTLSClientPeer)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuiteNoRoutes(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose.yml", path.Join(pathOutput, "test-suite-no-routes.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, "INSTRUMENTER_CONFIG_SUFFIX=-no-route")
+	require.NoError(t, compose.Up())
+	t.Run("RED metrics", testREDMetricsHTTPNoRoute)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuiteNoRoutesLowCardinality(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose.yml", path.Join(pathOutput, "test-suite-no-routes-low-cardinality.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, "INSTRUMENTER_CONFIG_SUFFIX=-no-route-lc")
+	require.NoError(t, compose.Up())
+	t.Run("RED metrics", testREDMetricsHTTPNoRouteLowCardinality)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_Elixir(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-elixir.yml", path.Join(pathOutput, "test-suite-elixir.log"))
+	require.NoError(t, err)
+	require.NoError(t, compose.Up())
+	t.Run("Elixir RED metrics", testREDMetricsElixirHTTP)
+	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+// logEnricherConfigV2 selects the config v2 twin of the log enricher OBI configuration
+const logEnricherConfigV2 = "-v2"
+
+// logEnricherConfigUnselected selects the log enricher OBI configuration whose log
+// enricher selection matches none of the instrumented processes
+const logEnricherConfigUnselected = "-unselected"
+
+// logEnricherSuite starts the log enricher compose with the OBI configuration variant
+// named by configSuffix ("" is the v1 file) and runs the suite's subtests against it
+func logEnricherSuite(t *testing.T, name, configSuffix string, env []string, subtests func(t *testing.T)) {
+	compose, err := docker.ComposeSuite("docker-compose-log-enricher.yml", path.Join(pathOutput, "test-suite-log-enricher-"+name+configSuffix+".log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `INSTRUMENTER_CONFIG_SUFFIX=`+configSuffix)
+	compose.Env = append(compose.Env, env...)
+	require.NoError(t, compose.Up())
+
+	subtests(t)
+	require.NoError(t, compose.Close())
+}
+
+func logEnricherHTTPSuite(t *testing.T, configSuffix string) {
+	logEnricherSuite(t, "http", configSuffix, []string{`OTEL_EBPF_OPEN_PORT=8380`, `OTEL_EBPF_EXECUTABLE_PATH=`}, func(t *testing.T) {
+		t.Run("Log Enricher HTTP", func(t *testing.T) {
+			testLogEnricher(t, logEnricherHTTPConstants)
+		})
+		t.Run("Log Enricher nested spans python", func(t *testing.T) {
+			testLogEnricherNestedSpansPython(t, logEnricherHTTPConstants)
+		})
+	})
+}
+
+func TestSuite_LogEnricherHTTP(t *testing.T) {
+	logEnricherHTTPSuite(t, "")
+}
+
+func TestSuite_LogEnricherHTTPConfigV2(t *testing.T) {
+	logEnricherHTTPSuite(t, logEnricherConfigV2)
+}
+
+func logEnricherGoGRPCSuite(t *testing.T, configSuffix string) {
+	logEnricherSuite(t, "go-grpc", configSuffix, []string{`OTEL_EBPF_OPEN_PORT=50051`, `OTEL_EBPF_EXECUTABLE_PATH=`}, func(t *testing.T) {
+		t.Run("Log Enricher Go gRPC", func(t *testing.T) {
+			testLogEnricher(t, logEnricherGoGRPCConstants)
+		})
+		t.Run("Log Enricher Go writev clamp", func(t *testing.T) {
+			testLogEnricherWritevClamp(t, logEnricherGoWritevRegressionConstants)
+		})
+		t.Run("Log Enricher plain text", func(t *testing.T) {
+			testLogEnricherPlainText(t, logEnricherGoGRPCConstants)
+		})
+		t.Run("Log Enricher short write", func(t *testing.T) {
+			testLogEnricherShortWrite(t, logEnricherGoGRPCConstants)
+		})
+		t.Run("Log Enricher nested spans", func(t *testing.T) {
+			testLogEnricherNestedSpans(t, logEnricherGoGRPCConstants)
+		})
+		t.Run("Log Enricher nested spans goroutine", func(t *testing.T) {
+			testLogEnricherNestedSpansGoroutine(t, logEnricherGoGRPCConstants)
+		})
+		t.Run("Log Enricher nested spans deep", func(t *testing.T) {
+			testLogEnricherNestedSpansDeep(t, logEnricherGoGRPCConstants)
+		})
+		t.Run("Log Enricher nested spans same kind", func(t *testing.T) {
+			testLogEnricherNestedSpansSameKind(t, logEnricherGoGRPCConstants)
+		})
+		t.Run("Log Enricher nested spans close goroutine", func(t *testing.T) {
+			testLogEnricherNestedSpansCloseGoroutine(t, logEnricherGoGRPCConstants)
+		})
+		t.Run("Log Enricher nested spans close A/B", func(t *testing.T) {
+			testLogEnricherNestedSpansCloseAB(t, logEnricherGoGRPCConstants, 0, "abreq")
+		})
+		t.Run("Log Enricher nested spans close A/B overflowed", func(t *testing.T) {
+			// the stack holds k_obi_ctx_max_depth (4) frames: the HTTP server span
+			// plus three SQL spans fill it, so A's gRPC client span is only counted
+			testLogEnricherNestedSpansCloseAB(t, logEnricherGoGRPCConstants, 3, "abdeep")
+		})
+	})
+}
+
+func TestSuite_LogEnricherGoGRPC(t *testing.T) {
+	logEnricherGoGRPCSuite(t, "")
+}
+
+func TestSuite_LogEnricherGoGRPCConfigV2(t *testing.T) {
+	logEnricherGoGRPCSuite(t, logEnricherConfigV2)
+}
+
+func logEnricherNodeJSSuite(t *testing.T, configSuffix string) {
+	logEnricherSuite(t, "nodejs", configSuffix, []string{`OTEL_EBPF_OPEN_PORT=3030`, `OTEL_EBPF_EXECUTABLE_PATH=`}, func(t *testing.T) {
+		t.Run("Log Enricher Node.js", func(t *testing.T) {
+			testLogEnricherNodeJS(t)
+		})
+	})
+}
+
+func TestSuite_LogEnricherNodeJS(t *testing.T) {
+	logEnricherNodeJSSuite(t, "")
+}
+
+func TestSuite_LogEnricherNodeJSConfigV2(t *testing.T) {
+	logEnricherNodeJSSuite(t, logEnricherConfigV2)
+}
+
+func logEnricherJavaSuite(t *testing.T, configSuffix string) {
+	logEnricherSuite(t, "java", configSuffix, []string{`OTEL_EBPF_OPEN_PORT=8085`, `OTEL_EBPF_EXECUTABLE_PATH=`}, func(t *testing.T) {
+		t.Run("Log Enricher Java", func(t *testing.T) {
+			testLogEnricherJava(t)
+		})
+	})
+}
+
+func TestSuite_LogEnricherJava(t *testing.T) {
+	logEnricherJavaSuite(t, "")
+}
+
+func TestSuite_LogEnricherJavaConfigV2(t *testing.T) {
+	logEnricherJavaSuite(t, logEnricherConfigV2)
+}
+
+func logEnricherRubySuite(t *testing.T, configSuffix string) {
+	logEnricherSuite(t, "ruby", configSuffix, []string{`OTEL_EBPF_OPEN_PORT=3040`, `OTEL_EBPF_EXECUTABLE_PATH=`}, func(t *testing.T) {
+		t.Run("Log Enricher Ruby puts (writev)", func(t *testing.T) {
+			testLogEnricherRuby(t, logEnricherRubyWritevConstants)
+		})
+		t.Run("Log Enricher Ruby syswrite (write)", func(t *testing.T) {
+			testLogEnricherRuby(t, logEnricherRubyWriteConstants)
+		})
+	})
+}
+
+func TestSuite_LogEnricherRuby(t *testing.T) {
+	logEnricherRubySuite(t, "")
+}
+
+func TestSuite_LogEnricherRubyConfigV2(t *testing.T) {
+	logEnricherRubySuite(t, logEnricherConfigV2)
+}
+
+func logEnricherDotNetSuite(t *testing.T, configSuffix string) {
+	logEnricherSuite(t, "dotnet", configSuffix, []string{`OTEL_EBPF_OPEN_PORT=5266`, `OTEL_EBPF_EXECUTABLE_PATH=`}, func(t *testing.T) {
+		t.Run("Log Enricher .NET", func(t *testing.T) {
+			testLogEnricherDotNet(t)
+		})
+	})
+}
+
+func TestSuite_LogEnricherDotNet(t *testing.T) {
+	logEnricherDotNetSuite(t, "")
+}
+
+func TestSuite_LogEnricherDotNetConfigV2(t *testing.T) {
+	logEnricherDotNetSuite(t, logEnricherConfigV2)
+}
+
+func logEnricherPythonAsyncSuite(t *testing.T, configSuffix string) {
+	logEnricherSuite(t, "pythonasync", configSuffix, []string{`OTEL_EBPF_OPEN_PORT=8391`, `OTEL_EBPF_EXECUTABLE_PATH=`}, func(t *testing.T) {
+		t.Run("Log Enricher Python async", func(t *testing.T) {
+			testLogEnricherPythonAsync(t)
+		})
+		// Must run after the regular Python async test: this subtest causes OBI to
+		// flag the service as OTel-exporting, which persists for the rest of the
+		// container's lifetime.
+		t.Run("Log Enricher Python async OTel-instrumented", func(t *testing.T) {
+			testLogEnricherPythonAsyncOTelInstrumented(t)
+		})
+	})
+}
+
+func TestSuite_LogEnricherPythonAsync(t *testing.T) {
+	logEnricherPythonAsyncSuite(t, "")
+}
+
+func TestSuite_LogEnricherPythonAsyncConfigV2(t *testing.T) {
+	logEnricherPythonAsyncSuite(t, logEnricherConfigV2)
+}
+
+func logEnricherShellSubstitutionSuite(t *testing.T, configSuffix string) {
+	logEnricherSuite(t, "shellsubst", configSuffix, []string{`OTEL_EBPF_OPEN_PORT=`, `OTEL_EBPF_EXECUTABLE_PATH=substsh`}, func(t *testing.T) {
+		t.Run("Log Enricher shell command substitution", func(t *testing.T) {
+			testLogEnricherShellSubstitution(t)
+		})
+	})
+}
+
+func TestSuite_LogEnricherShellSubstitution(t *testing.T) {
+	logEnricherShellSubstitutionSuite(t, "")
+}
+
+func TestSuite_LogEnricherShellSubstitutionConfigV2(t *testing.T) {
+	logEnricherShellSubstitutionSuite(t, logEnricherConfigV2)
+}
+
+func logEnricherMultiSegWritevSuite(t *testing.T, configSuffix string) {
+	logEnricherSuite(t, "multiseg-writev", configSuffix, []string{`OTEL_EBPF_OPEN_PORT=8388`, `OTEL_EBPF_EXECUTABLE_PATH=`}, func(t *testing.T) {
+		t.Run("Log Enricher multi-seg writev", func(t *testing.T) {
+			testLogEnricherMultiSegWritev(t)
+		})
+		t.Run("Log Enricher shipper filters", func(t *testing.T) {
+			testLogEnricherShipperFilters(t)
+		})
+	})
+}
+
+func TestSuite_LogEnricherMultiSegWritev(t *testing.T) {
+	logEnricherMultiSegWritevSuite(t, "")
+}
+
+func TestSuite_LogEnricherMultiSegWritevConfigV2(t *testing.T) {
+	logEnricherMultiSegWritevSuite(t, logEnricherConfigV2)
+}
+
+func logEnricherTTYSuite(t *testing.T, configSuffix string) {
+	logEnricherSuite(t, "tty", configSuffix, []string{`OTEL_EBPF_OPEN_PORT=8389`, `OTEL_EBPF_EXECUTABLE_PATH=`}, func(t *testing.T) {
+		t.Run("Log Enricher terminal stdout", func(t *testing.T) {
+			testLogEnricherTTY(t)
+		})
+	})
+}
+
+func TestSuite_LogEnricherTTY(t *testing.T) {
+	logEnricherTTYSuite(t, "")
+}
+
+func TestSuite_LogEnricherTTYConfigV2(t *testing.T) {
+	logEnricherTTYSuite(t, logEnricherConfigV2)
+}
+
+func logEnricherUnselectedServiceSuite(t *testing.T, configSuffix string) {
+	logEnricherSuite(t, "http", logEnricherConfigUnselected+configSuffix, []string{`OTEL_EBPF_OPEN_PORT=8380`, `OTEL_EBPF_EXECUTABLE_PATH=`}, func(t *testing.T) {
+		t.Run("Log Enricher unselected service", func(t *testing.T) {
+			testLogEnricherUnselectedService(t, logEnricherHTTPConstants)
+		})
+	})
+}
+
+func TestSuite_LogEnricherUnselectedService(t *testing.T) {
+	logEnricherUnselectedServiceSuite(t, "")
+}
+
+func TestSuite_LogEnricherUnselectedServiceConfigV2(t *testing.T) {
+	logEnricherUnselectedServiceSuite(t, logEnricherConfigV2)
+}
+
+// The idea behind this test suite is to make sure that when an HTTP request is bigger than 1KB,
+// the traceparent is detected and parsed correctly during an ingress flow (protocol_http kprob)
+// and an egress flow (tpinjector sk_msg kprobe).
+// In previous versions of OBI, tpinjector.c:obi_packet_extender_find_existing_tp()
+// and protocol_http.h:__obi_continue_protocol_http_tp() had problematic bitwise operations that
+// can change or corrupt the traceparent header when parsing a 1KB+ HTTP request.
+func TestSuite_LargeHTTPRequest(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-large-http-req.yml", path.Join(pathOutput, "test-suite-large-http-req.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=3030`, `OTEL_EBPF_EXECUTABLE_PATH=`)
+	require.NoError(t, compose.Up())
+
+	t.Run("Large HTTP Request egress flow (kprobe: tpinjector[sk_msg])", func(t *testing.T) {
+		waitForTestComponents(t, "http://localhost:3035")
+		testLargeHTTPRequestEgress(t)
+	})
+
+	t.Run("Large HTTP Request ingress flow (kprobe: protocol_http)", func(t *testing.T) {
+		testLargeHTTPRequestIngress(t)
+	})
+
+	t.Run("Large HTTP Request egress flow with arbitrary size (kprobe: tpinjector[sk_msg])", func(t *testing.T) {
+		testLargeHTTPRequestEgressArbitrarySize(t)
+	})
+
+	t.Run("Large HTTP Request ingress flow with arbitrary size (kprobe: protocol_http)", func(t *testing.T) {
+		testLargeHTTPRequestIngressArbitrarySize(t)
+	})
+
+	require.NoError(t, compose.Close())
+}
+
+// Helpers
+
+var lockdownPath = "/sys/kernel/security/lockdown"
+
+func KernelLockdownMode() bool {
+	// If we can't find the file, assume no lockdown
+	if _, err := os.Stat(lockdownPath); err == nil {
+		f, err := os.Open(lockdownPath)
+		if err != nil {
+			return true
+		}
+
+		defer f.Close()
+		scanner := bufio.NewScanner(f)
+		if scanner.Scan() {
+			lockdown := scanner.Text()
+			switch {
+			case strings.Contains(lockdown, "[none]"):
+				return false
+			case strings.Contains(lockdown, "[integrity]"):
+				return true
+			case strings.Contains(lockdown, "[confidentiality]"):
+				return true
+			default:
+				return true
+			}
+		}
+
+		return true
+	}
+
+	return false
+}
+
+func kernelAtLeast(t *testing.T, wantMajor, wantMinor int) bool {
+	t.Helper()
+
+	release, err := os.ReadFile("/proc/sys/kernel/osrelease")
+	require.NoError(t, err)
+
+	var major, minor int
+	if _, err := fmt.Sscanf(string(release), "%d.%d", &major, &minor); err != nil {
+		return false
+	}
+
+	return major > wantMajor || (major == wantMajor && minor >= wantMinor)
+}

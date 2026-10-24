@@ -1,0 +1,307 @@
+//go:build linux
+
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package procs
+
+import (
+	"bytes"
+	"debug/elf"
+	"encoding/binary"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
+	"go.opentelemetry.io/obi/pkg/internal/fastelf"
+)
+
+func TestMatchExeSymbols_InvalidStringOffset(t *testing.T) {
+	const symSize = 24
+
+	data := make([]byte, symSize+4)
+	binary.LittleEndian.PutUint32(data[0:4], 128)
+	data[4] = 0x02
+	binary.LittleEndian.PutUint64(data[8:16], 1)
+	binary.LittleEndian.PutUint64(data[16:24], 1)
+	copy(data[symSize:], []byte("x\x00"))
+
+	ctx := &fastelf.ElfContext{
+		Data: data,
+		Sections: []*fastelf.Elf64_Shdr{
+			{
+				Type:    fastelf.SHT_SYMTAB,
+				Link:    1,
+				Offset:  0,
+				Size:    symSize,
+				Entsize: symSize,
+			},
+			{
+				Offset: symSize,
+			},
+		},
+	}
+
+	assert.Equal(t, svc.InstrumentableGeneric, matchExeSymbols(ctx))
+}
+
+// symbolTablesContext builds an ELF context with one symbol table per entry of
+// tables, each holding defined, sized STT_FUNC symbols with the given names in
+// the given order, as matchExeSymbols sees them in .dynsym or .symtab.
+func symbolTablesContext(tables ...[]string) *fastelf.ElfContext {
+	const symSize = 24
+
+	ctx := &fastelf.ElfContext{}
+	for _, names := range tables {
+		var strtab []byte
+		strtab = append(strtab, 0)
+		symtab := make([]byte, symSize*len(names))
+		for i, name := range names {
+			sym := symtab[i*symSize : (i+1)*symSize]
+			binary.LittleEndian.PutUint32(sym[0:4], uint32(len(strtab)))
+			sym[4] = byte(elf.STT_FUNC)
+			binary.LittleEndian.PutUint64(sym[8:16], 0x1000)
+			binary.LittleEndian.PutUint64(sym[16:24], 16)
+			strtab = append(strtab, name...)
+			strtab = append(strtab, 0)
+		}
+
+		symtabIndex := uint32(len(ctx.Sections))
+		ctx.Sections = append(ctx.Sections,
+			&fastelf.Elf64_Shdr{
+				Type:    fastelf.SHT_DYNSYM,
+				Link:    symtabIndex + 1,
+				Offset:  uint64(len(ctx.Data)),
+				Size:    uint64(len(symtab)),
+				Entsize: symSize,
+			},
+			&fastelf.Elf64_Shdr{
+				Offset: uint64(len(ctx.Data) + len(symtab)),
+				Size:   uint64(len(strtab)),
+			},
+		)
+		ctx.Data = append(ctx.Data, symtab...)
+		ctx.Data = append(ctx.Data, strtab...)
+	}
+
+	return ctx
+}
+
+func TestMatchExeSymbols_RustMarkerRanksLast(t *testing.T) {
+	const (
+		nodeSymbol = "_ZN4node5StartEiPPc"
+		rustSymbol = "_RNvCs2ZxxKbmjnch_7___rustc20___rust_panic_cleanup"
+		jvmSymbol  = "JVM_GetVersion"
+		// Bun re-exports node:: API symbols such as MakeCallback; they are
+		// not Node.js runtime symbols, so they must not override a Rust marker.
+		bunReexport = "_ZN4node12MakeCallbackEPN2v87IsolateENS0_5LocalINS0_6ObjectEEEPKciPNS3_INS0_5ValueEEENS_13async_contextE"
+		graalSymbol = "graal_create_isolate"
+	)
+
+	tests := []struct {
+		name   string
+		tables [][]string
+		want   svc.InstrumentableType
+	}{
+		{"node only", [][]string{{"main", nodeSymbol}}, svc.InstrumentableNodejs},
+		{"node before rust", [][]string{{nodeSymbol, rustSymbol}}, svc.InstrumentableNodejs},
+		{"rust before node", [][]string{{rustSymbol, nodeSymbol}}, svc.InstrumentableNodejs},
+		{"rust in the first table, node in the second", [][]string{{rustSymbol}, {nodeSymbol}}, svc.InstrumentableNodejs},
+		{"rust in the first table, no marker in the second", [][]string{{rustSymbol}, {"main"}}, svc.InstrumentableRust},
+		{"rust only", [][]string{{"main", rustSymbol}}, svc.InstrumentableRust},
+		{"java before rust", [][]string{{jvmSymbol, rustSymbol}}, svc.InstrumentableJavaNative},
+		{"rust before java", [][]string{{rustSymbol, jvmSymbol}}, svc.InstrumentableJavaNative},
+		{"graal before rust", [][]string{{graalSymbol, rustSymbol}}, svc.InstrumentableJavaNative},
+		{"rust in the first table, graal in the second", [][]string{{rustSymbol}, {graalSymbol}}, svc.InstrumentableJavaNative},
+		{"rust with a bun-style node re-export", [][]string{{rustSymbol, bunReexport}}, svc.InstrumentableRust},
+		{"node in the first table, rust in the second", [][]string{{nodeSymbol}, {rustSymbol}}, svc.InstrumentableNodejs},
+		{"no marker", [][]string{{"main", "napi_create_function"}}, svc.InstrumentableGeneric},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, matchExeSymbols(symbolTablesContext(tt.tables...)))
+		})
+	}
+}
+
+func TestMatchExeSymbols_InvalidStringTableOffset(t *testing.T) {
+	const symSize = 24
+
+	ctx := &fastelf.ElfContext{
+		Data: make([]byte, symSize),
+		Sections: []*fastelf.Elf64_Shdr{
+			{
+				Type:    fastelf.SHT_SYMTAB,
+				Link:    1,
+				Size:    symSize,
+				Entsize: symSize,
+			},
+			{
+				Offset: ^uint64(0),
+				Size:   1,
+			},
+		},
+	}
+
+	assert.Equal(t, svc.InstrumentableGeneric, matchExeSymbols(ctx))
+}
+
+func TestFindExeSymbolsExactLookup(t *testing.T) {
+	const symbolName = "main.exactLookupTarget"
+
+	f := openSymbolFixtureELF(t)
+	defer f.Close()
+
+	syms, err := FindExeSymbols(f, []string{symbolName})
+	require.NoError(t, err)
+
+	sym, ok := syms[symbolName]
+	require.True(t, ok)
+	assert.Equal(t, symbolName, sym.Name)
+	assert.NotZero(t, sym.Off)
+	assert.NotZero(t, sym.Value)
+	assert.NotZero(t, sym.Len)
+	assert.NotNil(t, sym.Prog)
+}
+
+func TestFindExeSymbolsSubstringLookup(t *testing.T) {
+	const (
+		symbolName = "main.substringLookupTarget"
+		substring  = "substringLookup"
+	)
+
+	f := openSymbolFixtureELF(t)
+	defer f.Close()
+
+	syms, err := FindExeSymbolsBySubstring(f, []string{substring})
+	require.NoError(t, err)
+
+	sym, ok := syms[substring]
+	require.True(t, ok)
+	assert.Equal(t, symbolName, sym.Name)
+	assert.NotZero(t, sym.Off)
+	assert.NotZero(t, sym.Len)
+	assert.NotNil(t, sym.Prog)
+}
+
+func TestFindExeSymbolsByNameAndSubstring(t *testing.T) {
+	const (
+		exactSymbolName    = "main.exactLookupTarget"
+		substringSymbol    = "main.substringLookupTarget"
+		symbolNameFragment = "substringLookup"
+	)
+
+	f := openSymbolFixtureELF(t)
+	defer f.Close()
+
+	exactSyms, substringSyms, err := FindExeSymbolsByNameAndSubstring(
+		f,
+		[]string{exactSymbolName},
+		[]string{symbolNameFragment},
+	)
+	require.NoError(t, err)
+
+	exactSym, ok := exactSyms[exactSymbolName]
+	require.True(t, ok)
+	assert.Equal(t, exactSymbolName, exactSym.Name)
+	assert.NotZero(t, exactSym.Off)
+	assert.NotZero(t, exactSym.Len)
+	assert.NotNil(t, exactSym.Prog)
+
+	substringSym, ok := substringSyms[symbolNameFragment]
+	require.True(t, ok)
+	assert.Equal(t, substringSymbol, substringSym.Name)
+	assert.NotZero(t, substringSym.Off)
+	assert.NotZero(t, substringSym.Len)
+	assert.NotNil(t, substringSym.Prog)
+}
+
+func openSymbolFixtureELF(t *testing.T) *elf.File {
+	t.Helper()
+
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "main.go")
+	exePath := filepath.Join(dir, "symbol-fixture")
+
+	require.NoError(t, os.WriteFile(sourcePath, []byte(`package main
+
+//go:noinline
+func exactLookupTarget() {}
+
+//go:noinline
+func substringLookupTarget() {}
+
+func main() {
+	exactLookupTarget()
+	substringLookupTarget()
+}
+`), 0o600))
+
+	cmd := exec.Command("go", "build", "-gcflags=all=-l", "-o", exePath, sourcePath)
+	cmd.Env = append(os.Environ(), "GO111MODULE=off")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	require.NoError(t, cmd.Run(), out.String())
+
+	f, err := elf.Open(exePath)
+	require.NoError(t, err)
+
+	return f
+}
+
+// The symbols are matched through the same fastelf scan that runs in
+// production, which admits only defined, sized STT_FUNC entries in .symtab or
+// .dynsym. A table of hand-written mangled names cannot catch a Node build
+// whose node:: symbols are undefined imports or STT_OBJECT, so the real
+// executable is typed here rather than the strings it is expected to contain.
+func TestFindLanguageFromElf_NodeBinary(t *testing.T) {
+	path, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not found in PATH")
+	}
+
+	resolved, err := filepath.EvalSymlinks(path)
+	require.NoError(t, err)
+
+	if isLauncherForSharedRuntime(t, resolved) {
+		t.Skip("this node links the runtime as libnode.so, which the shared-library pass types")
+	}
+
+	assert.Equal(t, svc.InstrumentableNodejs, findLanguageFromElf(resolved))
+}
+
+func TestFindLanguageFromElf_NonNodeExecutable(t *testing.T) {
+	self, err := os.Executable()
+	require.NoError(t, err)
+
+	assert.NotEqual(t, svc.InstrumentableNodejs, findLanguageFromElf(self))
+}
+
+func isLauncherForSharedRuntime(t *testing.T, path string) bool {
+	t.Helper()
+
+	f, err := elf.Open(path)
+	require.NoError(t, err)
+	defer f.Close()
+
+	libs, err := f.ImportedLibraries()
+	if err != nil {
+		return false
+	}
+
+	for _, lib := range libs {
+		if strings.Contains(lib, "libnode.so") {
+			return true
+		}
+	}
+
+	return false
+}

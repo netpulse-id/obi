@@ -1,0 +1,136 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package integration // import "go.opentelemetry.io/obi/internal/test/integration"
+
+import (
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"go.opentelemetry.io/obi/internal/test/integration/components/promtest"
+	"go.opentelemetry.io/obi/internal/test/tools"
+	ti "go.opentelemetry.io/obi/pkg/test/integration"
+)
+
+func testREDMetricsForNetHTTPLibrary(t *testing.T, url string, comm string) {
+	urlPath := "/greeting"
+
+	// Call 3 times the instrumented service, forcing it to:
+	// - take a large JSON file
+	// - returning a 200 code
+	for range 4 {
+		ti.DoHTTPGet(t, url+urlPath, 200)
+	}
+
+	// Eventually, Prometheus would make this query visible
+	pq := promtest.Client{HostPort: prometheusHostPort}
+	var results []promtest.Result
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		var err error
+		results, err = pq.Query(`http_server_request_duration_seconds_count{` +
+			`http_request_method="GET",` +
+			`http_response_status_code="200",` +
+			`service_namespace="integration-test",` +
+			`service_name="` + comm + `",` +
+			`service_version="2.3.4-beta.1",` +
+			`url_path="` + urlPath + `"}`)
+		require.NoError(ct, err)
+		enoughPromResults(ct, results)
+		val := totalPromCount(ct, results)
+		assert.LessOrEqual(ct, 2, val, "received:", tools.ToJSON(val))
+		if len(results) > 0 {
+			res := results[0]
+			addr := res.Metric["client_address"]
+			assert.NotNil(ct, addr)
+		}
+	}, testTimeout, 100*time.Millisecond)
+
+	// Eventually, Prometheus would make this query visible
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		var err error
+		results, err = pq.Query(`http_client_request_duration_seconds_count{` +
+			`http_request_method="GET",` +
+			`http_response_status_code="200",` +
+			`service_namespace="integration-test",` +
+			`service_name="` + comm + `",` +
+			`service_version="2.3.4-beta.1"}`)
+		require.NoError(ct, err)
+		enoughPromResults(ct, results)
+		val := totalPromCount(ct, results)
+		assert.LessOrEqual(ct, 2, val, "received:", tools.ToJSON(val))
+	}, testTimeout, 100*time.Millisecond)
+}
+
+func testREDMetricsDotNetHTTP(t *testing.T) {
+	for _, testCaseURL := range []string{
+		"http://localhost:5267",
+	} {
+		t.Run(testCaseURL, func(t *testing.T) {
+			waitForTestComponents(t, testCaseURL)
+			testREDMetricsForNetHTTPLibrary(t, testCaseURL, "dotnetserver") // reusing what we do for NodeJS
+			testDotnetHarvestedRoute(t, testCaseURL)
+		})
+	}
+}
+
+func testDotnetHarvestedRoute(t *testing.T, url string) {
+	for range 4 {
+		ti.DoHTTPGet(t, url+"/api/customers/42", 200)
+	}
+
+	pq := promtest.Client{HostPort: prometheusHostPort}
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		results, err := pq.Query(`http_server_request_duration_seconds_count{` +
+			`http_request_method="GET",` +
+			`service_name="dotnetserver",` +
+			`http_route="/api/customers/{customer_id:int}"}`)
+		require.NoError(ct, err)
+		enoughPromResults(ct, results)
+		assert.LessOrEqual(ct, 2, totalPromCount(ct, results))
+	}, testTimeout, 100*time.Millisecond)
+}
+
+// Special test without checks for a peer address. With the async nature of SSL on .NET we can't always get
+// this information
+func testREDMetricsForNetHTTPSLibrary(t *testing.T, url string, comm string) {
+	path := "/greeting"
+
+	// Call 3 times the instrumented service, forcing it to:
+	// - take at least 30ms to respond
+	// - returning a 204 code
+	for range 4 {
+		ti.DoHTTPGet(t, url+path, 200)
+	}
+
+	// Eventually, Prometheus would make this query visible
+	pq := promtest.Client{HostPort: prometheusHostPort}
+	var results []promtest.Result
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		var err error
+		results, err = pq.Query(`http_server_request_duration_seconds_count{` +
+			`http_request_method="GET",` +
+			`http_response_status_code="200",` +
+			`service_namespace="integration-test",` +
+			`service_name="` + comm + `",` +
+			`service_version="2.3.4-beta.1",` +
+			`url_path="` + path + `"}`)
+		require.NoError(ct, err)
+		enoughPromResults(ct, results)
+		val := totalPromCount(ct, results)
+		assert.LessOrEqual(ct, 3, val)
+	}, testTimeout, 100*time.Millisecond)
+}
+
+func testREDMetricsDotNetHTTPS(t *testing.T) {
+	for _, testCaseURL := range []string{
+		"https://localhost:7034",
+	} {
+		t.Run(testCaseURL, func(t *testing.T) {
+			waitForTestComponents(t, testCaseURL)
+			testREDMetricsForNetHTTPSLibrary(t, testCaseURL, "dotnetserver") // reusing what we do for NodeJS
+		})
+	}
+}

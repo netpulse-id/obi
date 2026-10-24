@@ -1,0 +1,1753 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package request
+
+import (
+	"encoding/json"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"go.opentelemetry.io/otel/attribute"
+	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
+
+	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
+	attr "go.opentelemetry.io/obi/pkg/export/attributes/names"
+)
+
+func TestSpanOTELGetters_K8SClientNamespace(t *testing.T) {
+	tests := []struct {
+		name              string
+		span              *Span
+		expectedNamespace string
+	}{
+		{
+			name: "client span - uses service namespace from metadata",
+			span: &Span{
+				Type: EventTypeHTTPClient,
+				Service: svc.Attrs{
+					UID: svc.UID{
+						Name:      "test-service",
+						Namespace: "test-namespace",
+					},
+					Metadata: map[attr.Name]string{
+						attr.K8sNamespaceName: "k8s-namespace",
+					},
+				},
+				OtherK8SNamespace: "other-k8s-namespace",
+			},
+			expectedNamespace: "k8s-namespace",
+		},
+		{
+			name: "server span - uses OtherK8SNamespace",
+			span: &Span{
+				Type: EventTypeHTTP,
+				Service: svc.Attrs{
+					UID: svc.UID{
+						Name:      "test-service",
+						Namespace: "test-namespace",
+					},
+					Metadata: map[attr.Name]string{
+						attr.K8sNamespaceName: "k8s-namespace",
+					},
+				},
+				OtherK8SNamespace: "other-k8s-namespace",
+			},
+			expectedNamespace: "other-k8s-namespace",
+		},
+		{
+			name: "client span - empty k8s namespace",
+			span: &Span{
+				Type: EventTypeGRPCClient,
+				Service: svc.Attrs{
+					UID: svc.UID{
+						Name:      "test-service",
+						Namespace: "test-namespace",
+					},
+					Metadata: map[attr.Name]string{},
+				},
+				OtherK8SNamespace: "other-k8s-namespace",
+			},
+			expectedNamespace: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			getter, ok := spanOTELGetters(attr.K8SClientNamespace)
+			require.True(t, ok, "getter should be found for K8SClientNamespace")
+
+			kv := getter(tt.span)
+			assert.Equal(t, string(attr.K8SClientNamespace), string(kv.Key))
+			assert.Equal(t, tt.expectedNamespace, kv.Value.AsString())
+		})
+	}
+}
+
+func TestSpanOTELGetters_GenAIRequestModel(t *testing.T) {
+	getter, ok := spanOTELGetters(attr.GenAIRequestModel)
+	require.True(t, ok)
+
+	named := &Span{GenAI: &GenAI{OpenAI: &VendorOpenAI{Request: OpenAIInput{Model: "gpt-4o"}}}}
+	assert.Equal(t, "gpt-4o", getter(named).Value.AsString())
+
+	unnamed := &Span{GenAI: &GenAI{OpenAI: &VendorOpenAI{}}}
+	assert.False(t, getter(unnamed).Valid(), "a request that named no model reports no gen_ai.request.model")
+}
+
+func TestSpanOTELGetters_DBCollectionName(t *testing.T) {
+	tests := []struct {
+		name     string
+		span     *Span
+		expected string
+	}{
+		{
+			name: "Elasticsearch collection",
+			span: &Span{
+				Type:          EventTypeHTTPClient,
+				SubType:       HTTPSubtypeElasticsearch,
+				Elasticsearch: &Elasticsearch{DBCollectionName: "products"},
+			},
+			expected: "products",
+		},
+		{
+			name:     "SQLPP collection",
+			span:     &Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeSQLPP, Route: "inventory"},
+			expected: "inventory",
+		},
+		{
+			name:     "SQL client collection",
+			span:     &Span{Type: EventTypeSQLClient, Path: "customers"},
+			expected: "customers",
+		},
+		{
+			name:     "SQL server collection",
+			span:     &Span{Type: EventTypeSQLServer, Path: "orders"},
+			expected: "orders",
+		},
+		{
+			name:     "Aerospike client collection",
+			span:     &Span{Type: EventTypeAerospikeClient, Path: "sessions"},
+			expected: "sessions",
+		},
+		{
+			name:     "Aerospike server collection",
+			span:     &Span{Type: EventTypeAerospikeServer, Path: "sessions"},
+			expected: "sessions",
+		},
+		{
+			name:     "MongoDB collection",
+			span:     &Span{Type: EventTypeMongoClient, Path: "a_collection"},
+			expected: "a_collection",
+		},
+		{
+			name:     "Couchbase collection",
+			span:     &Span{Type: EventTypeCouchbaseClient, Path: "sofa"},
+			expected: "sofa",
+		},
+		{
+			name: "nil Elasticsearch metadata",
+			span: &Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeElasticsearch},
+		},
+		{
+			name: "unsupported span type",
+			span: &Span{Type: EventTypeHTTP, Path: "ignored"},
+		},
+		{
+			name: "SQL client without collection",
+			span: &Span{Type: EventTypeSQLClient},
+		},
+	}
+
+	getter, ok := spanOTELGetters(attr.DBCollectionName)
+	require.True(t, ok)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			kv := getter(tt.span)
+			if tt.expected == "" {
+				assert.False(t, kv.Valid())
+				return
+			}
+			assert.Equal(t, attribute.Key(attr.DBCollectionName), kv.Key)
+			assert.Equal(t, tt.expected, kv.Value.AsString())
+		})
+	}
+}
+
+func TestSpanOTELGetters_K8SServerNamespace(t *testing.T) {
+	tests := []struct {
+		name              string
+		span              *Span
+		expectedNamespace string
+	}{
+		{
+			name: "client span - uses OtherK8SNamespace",
+			span: &Span{
+				Type: EventTypeHTTPClient,
+				Service: svc.Attrs{
+					UID: svc.UID{
+						Name:      "test-service",
+						Namespace: "test-namespace",
+					},
+					Metadata: map[attr.Name]string{
+						attr.K8sNamespaceName: "k8s-namespace",
+					},
+				},
+				OtherK8SNamespace: "other-k8s-namespace",
+			},
+			expectedNamespace: "other-k8s-namespace",
+		},
+		{
+			name: "server span - uses service namespace from metadata",
+			span: &Span{
+				Type: EventTypeHTTP,
+				Service: svc.Attrs{
+					UID: svc.UID{
+						Name:      "test-service",
+						Namespace: "test-namespace",
+					},
+					Metadata: map[attr.Name]string{
+						attr.K8sNamespaceName: "k8s-namespace",
+					},
+				},
+				OtherK8SNamespace: "other-k8s-namespace",
+			},
+			expectedNamespace: "k8s-namespace",
+		},
+		{
+			name: "server span - empty k8s namespace in metadata",
+			span: &Span{
+				Type: EventTypeGRPC,
+				Service: svc.Attrs{
+					UID: svc.UID{
+						Name:      "test-service",
+						Namespace: "test-namespace",
+					},
+					Metadata: map[attr.Name]string{},
+				},
+				OtherK8SNamespace: "other-k8s-namespace",
+			},
+			expectedNamespace: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			getter, ok := spanOTELGetters(attr.K8SServerNamespace)
+			require.True(t, ok, "getter should be found for K8SServerNamespace")
+
+			kv := getter(tt.span)
+			assert.Equal(t, string(attr.K8SServerNamespace), string(kv.Key))
+			assert.Equal(t, tt.expectedNamespace, kv.Value.AsString())
+		})
+	}
+}
+
+func TestSpanOTELGetters_K8SClientCluster(t *testing.T) {
+	tests := []struct {
+		name            string
+		span            *Span
+		expectedCluster string
+	}{
+		{
+			name: "client span - uses service cluster from metadata",
+			span: &Span{
+				Type: EventTypeHTTPClient,
+				Service: svc.Attrs{
+					UID: svc.UID{
+						Name:      "test-service",
+						Namespace: "test-namespace",
+					},
+					Metadata: map[attr.Name]string{
+						attr.K8sClusterName: "k8s-cluster",
+					},
+				},
+				OtherK8SNamespace: "other-k8s-namespace",
+			},
+			expectedCluster: "k8s-cluster",
+		},
+		{
+			name: "server span with peer k8s namespace - uses service cluster",
+			span: &Span{
+				Type: EventTypeHTTP,
+				Service: svc.Attrs{
+					UID: svc.UID{
+						Name:      "test-service",
+						Namespace: "test-namespace",
+					},
+					Metadata: map[attr.Name]string{
+						attr.K8sClusterName: "k8s-cluster",
+					},
+				},
+				OtherK8SNamespace: "other-k8s-namespace",
+			},
+			expectedCluster: "k8s-cluster",
+		},
+		{
+			name: "server span without peer k8s namespace - empty cluster",
+			span: &Span{
+				Type: EventTypeGRPC,
+				Service: svc.Attrs{
+					UID: svc.UID{
+						Name:      "test-service",
+						Namespace: "test-namespace",
+					},
+					Metadata: map[attr.Name]string{
+						attr.K8sClusterName: "k8s-cluster",
+					},
+				},
+				OtherK8SNamespace: "",
+			},
+			expectedCluster: "",
+		},
+		{
+			name: "client span - no cluster in metadata",
+			span: &Span{
+				Type: EventTypeGRPCClient,
+				Service: svc.Attrs{
+					UID: svc.UID{
+						Name:      "test-service",
+						Namespace: "test-namespace",
+					},
+					Metadata: map[attr.Name]string{},
+				},
+				OtherK8SNamespace: "other-k8s-namespace",
+			},
+			expectedCluster: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			getter, ok := spanOTELGetters(attr.K8SClientCluster)
+			require.True(t, ok, "getter should be found for K8SClientCluster")
+
+			kv := getter(tt.span)
+			assert.Equal(t, string(attr.K8SClientCluster), string(kv.Key))
+			assert.Equal(t, tt.expectedCluster, kv.Value.AsString())
+		})
+	}
+}
+
+func TestSpanOTELGetters_K8SServerCluster(t *testing.T) {
+	tests := []struct {
+		name            string
+		span            *Span
+		expectedCluster string
+	}{
+		{
+			name: "client span with peer k8s namespace - uses service cluster",
+			span: &Span{
+				Type: EventTypeHTTPClient,
+				Service: svc.Attrs{
+					UID: svc.UID{
+						Name:      "test-service",
+						Namespace: "test-namespace",
+					},
+					Metadata: map[attr.Name]string{
+						attr.K8sClusterName: "k8s-cluster",
+					},
+				},
+				OtherK8SNamespace: "other-k8s-namespace",
+			},
+			expectedCluster: "k8s-cluster",
+		},
+		{
+			name: "client span without peer k8s namespace - empty cluster",
+			span: &Span{
+				Type: EventTypeGRPCClient,
+				Service: svc.Attrs{
+					UID: svc.UID{
+						Name:      "test-service",
+						Namespace: "test-namespace",
+					},
+					Metadata: map[attr.Name]string{
+						attr.K8sClusterName: "k8s-cluster",
+					},
+				},
+				OtherK8SNamespace: "",
+			},
+			expectedCluster: "",
+		},
+		{
+			name: "server span - uses service cluster from metadata",
+			span: &Span{
+				Type: EventTypeHTTP,
+				Service: svc.Attrs{
+					UID: svc.UID{
+						Name:      "test-service",
+						Namespace: "test-namespace",
+					},
+					Metadata: map[attr.Name]string{
+						attr.K8sClusterName: "k8s-cluster",
+					},
+				},
+				OtherK8SNamespace: "other-k8s-namespace",
+			},
+			expectedCluster: "k8s-cluster",
+		},
+		{
+			name: "server span - no cluster in metadata",
+			span: &Span{
+				Type: EventTypeGRPC,
+				Service: svc.Attrs{
+					UID: svc.UID{
+						Name:      "test-service",
+						Namespace: "test-namespace",
+					},
+					Metadata: map[attr.Name]string{},
+				},
+				OtherK8SNamespace: "other-k8s-namespace",
+			},
+			expectedCluster: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			getter, ok := spanOTELGetters(attr.K8SServerCluster)
+			require.True(t, ok, "getter should be found for K8SServerCluster")
+
+			kv := getter(tt.span)
+			assert.Equal(t, string(attr.K8SServerCluster), string(kv.Key))
+			assert.Equal(t, tt.expectedCluster, kv.Value.AsString())
+		})
+	}
+}
+
+func TestSpanOTELGetters_MessagingOpName(t *testing.T) {
+	tests := []struct {
+		name     string
+		span     *Span
+		expected string
+	}{
+		{
+			name:     "kafka client send",
+			span:     &Span{Type: EventTypeKafkaClient, Method: MessagingSend},
+			expected: "send",
+		},
+		{
+			name:     "kafka server process",
+			span:     &Span{Type: EventTypeKafkaServer, Method: MessagingProcess},
+			expected: "process",
+		},
+		{
+			name:     "mqtt client publish",
+			span:     &Span{Type: EventTypeMQTTClient, Method: MessagingPublish},
+			expected: "publish",
+		},
+		{
+			name:     "mqtt server process",
+			span:     &Span{Type: EventTypeMQTTServer, Method: MessagingProcess},
+			expected: "process",
+		},
+		{
+			name:     "nats client publish",
+			span:     &Span{Type: EventTypeNATSClient, Method: MessagingPublish},
+			expected: "publish",
+		},
+		{
+			name:     "nats server process",
+			span:     &Span{Type: EventTypeNATSServer, Method: MessagingProcess},
+			expected: "process",
+		},
+		{
+			name:     "amqp client publish",
+			span:     &Span{Type: EventTypeAMQPClient, Method: MessagingPublish},
+			expected: "publish",
+		},
+		{
+			name: "aws sqs client uses the sqs operation name",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				SubType: HTTPSubtypeAWSSQS,
+				Method:  "POST",
+				AWS:     &AWS{SQS: AWSSQS{OperationName: "SendMessage"}},
+			},
+			expected: "SendMessage",
+		},
+		{
+			name:     "http span returns empty",
+			span:     &Span{Type: EventTypeHTTP, Method: "GET"},
+			expected: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			getter, ok := spanOTELGetters(attr.MessagingOpName)
+			require.True(t, ok, "getter should be found for MessagingOpName")
+
+			kv := getter(tt.span)
+			assert.Equal(t, string(attr.MessagingOpName), string(kv.Key))
+			assert.Equal(t, tt.expected, kv.Value.AsString())
+		})
+	}
+}
+
+func TestSpanOTELGetters_HTTPURLScheme(t *testing.T) {
+	tests := []struct {
+		name           string
+		span           *Span
+		expectedScheme string
+	}{
+		{
+			name:           "http scheme from statement",
+			span:           &Span{Statement: "http" + SchemeHostSeparator + "example.com"},
+			expectedScheme: "http",
+		},
+		{
+			name:           "https scheme from statement",
+			span:           &Span{Statement: "https" + SchemeHostSeparator + "api.example.com"},
+			expectedScheme: "https",
+		},
+		{
+			name:           "empty statement",
+			span:           &Span{Statement: ""},
+			expectedScheme: "",
+		},
+		{
+			name:           "statement without separator",
+			span:           &Span{Statement: "no-scheme-here"},
+			expectedScheme: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			getter, ok := spanOTELGetters(attr.HTTPURLScheme)
+			require.True(t, ok, "getter should be found for HTTPURLScheme")
+
+			kv := getter(tt.span)
+			assert.Equal(t, string(attr.HTTPURLScheme), string(kv.Key))
+			assert.Equal(t, tt.expectedScheme, kv.Value.AsString())
+		})
+	}
+}
+
+func TestSpanOTELGetters_HTTPRequestMethod(t *testing.T) {
+	getter, ok := spanOTELGetters(attr.HTTPRequestMethod)
+	require.True(t, ok, "getter should be found for HTTPRequestMethod")
+
+	t.Run("present when method is known", func(t *testing.T) {
+		kv := getter(&Span{Method: "GET"})
+		require.True(t, kv.Valid())
+		assert.Equal(t, string(attr.HTTPRequestMethod), string(kv.Key))
+		assert.Equal(t, "GET", kv.Value.AsString())
+	})
+
+	// Semconv: a method the instrumentation does not know MUST be reported as
+	// _OTHER, and one the parser could not read is not known.
+	t.Run("clamped when method is empty", func(t *testing.T) {
+		kv := getter(&Span{Method: ""})
+		require.True(t, kv.Valid())
+		assert.Equal(t, HTTPMethodOther, kv.Value.AsString())
+	})
+
+	// http.request.method is a closed enum, so an unclamped metric label is a
+	// weaver violation and an unbounded dimension.
+	t.Run("clamped when method is outside the enum", func(t *testing.T) {
+		for _, method := range []string{"PURGE", "PROPFIND", "get"} {
+			kv := getter(&Span{Method: method})
+			require.True(t, kv.Valid(), method)
+			assert.Equal(t, HTTPMethodOther, kv.Value.AsString(), method)
+		}
+	})
+}
+
+func TestSpanOTELGetters_SunRPC(t *testing.T) {
+	span := &Span{
+		Type:    EventTypeSunRPCClient,
+		Path:    "portmapper",
+		Route:   "0",
+		Method:  "0",
+		SubType: 2,
+		Status:  0,
+	}
+
+	stringTests := []struct {
+		name     string
+		attrName attr.Name
+		expected string
+	}{
+		{name: "rpc system", attrName: attr.RPCSystem, expected: "onc_rpc"},
+		{name: "rpc method", attrName: attr.RPCMethod, expected: "portmapper/0"},
+		{name: "program name", attrName: attr.OncRPCProgramName, expected: "portmapper"},
+		{name: "response status code", attrName: attr.RPCResponseStatusCode, expected: "0"},
+	}
+
+	for _, tt := range stringTests {
+		t.Run(tt.name, func(t *testing.T) {
+			getter, ok := spanOTELGetters(tt.attrName)
+			require.True(t, ok, "getter should be found for %s", tt.attrName)
+
+			kv := getter(span)
+			assert.Equal(t, string(tt.attrName), string(kv.Key))
+			assert.Equal(t, tt.expected, kv.Value.AsString())
+		})
+	}
+
+	t.Run("procedure number", func(t *testing.T) {
+		getter, ok := spanOTELGetters(attr.OncRPCProcedureNumber)
+		require.True(t, ok)
+		assert.Equal(t, semconv.OncRPCProcedureNumber(0), getter(span))
+	})
+
+	t.Run("version", func(t *testing.T) {
+		getter, ok := spanOTELGetters(attr.OncRPCVersion)
+		require.True(t, ok)
+		assert.Equal(t, semconv.OncRPCVersion(2), getter(span))
+	})
+
+	t.Run("rpc method omitted for reply-only", func(t *testing.T) {
+		getter, ok := spanOTELGetters(attr.RPCMethod)
+		require.True(t, ok)
+		replyOnly := &Span{Type: EventTypeSunRPCServer, Path: "sunrpc", Method: SunRPCSyntheticReplyMethod}
+		assert.False(t, getter(replyOnly).Valid())
+	})
+}
+
+func TestSpanOTELGetters_JSONRPCAttributes(t *testing.T) {
+	jsonrpcSpan := &Span{
+		SubType: HTTPSubtypeJSONRPC,
+		JSONRPC: &JSONRPC{
+			Version:   "2.0",
+			RequestID: "42",
+			ErrorCode: -32601,
+		},
+	}
+
+	nonJSONRPCSpan := &Span{
+		Type: EventTypeHTTP,
+	}
+
+	tests := []struct {
+		name     string
+		attrName attr.Name
+		span     *Span
+		expected string
+		// omitted asserts the getter returns an invalid (zero) KeyValue so
+		// the attribute is dropped instead of being emitted empty.
+		omitted bool
+	}{
+		{
+			name:     "rpc.method - qualified from the Go net/rpc service name",
+			attrName: attr.RPCMethod,
+			span: &Span{
+				SubType: HTTPSubtypeJSONRPC,
+				JSONRPC: &JSONRPC{Method: "Arith.Traceme", Version: JSONRPCVersionV1, ServiceQualified: true},
+			},
+			expected: "Arith/Traceme",
+		},
+		{
+			name:     "rpc.method - a payload-extracted dotted method is left whole",
+			attrName: attr.RPCMethod,
+			span: &Span{
+				SubType: HTTPSubtypeJSONRPC,
+				JSONRPC: &JSONRPC{Method: "inventory.lookup.v2", Version: "2.0"},
+			},
+			expected: "inventory.lookup.v2",
+		},
+		{
+			name:     "protocol version - JSON-RPC span",
+			attrName: attr.JSONRPCProtocolVersion,
+			span:     jsonrpcSpan,
+			expected: "2.0",
+		},
+		{
+			name:     "protocol version - non-JSON-RPC span",
+			attrName: attr.JSONRPCProtocolVersion,
+			span:     nonJSONRPCSpan,
+			expected: "",
+		},
+		{
+			name:     "request ID - JSON-RPC span",
+			attrName: attr.JSONRPCRequestID,
+			span:     jsonrpcSpan,
+			expected: "42",
+		},
+		{
+			name:     "request ID - non-JSON-RPC span",
+			attrName: attr.JSONRPCRequestID,
+			span:     nonJSONRPCSpan,
+			expected: "",
+		},
+		{
+			name:     "response status code - JSON-RPC span with error",
+			attrName: attr.RPCResponseStatusCode,
+			span:     jsonrpcSpan,
+			expected: "-32601",
+		},
+		{
+			name:     "response status code - non-JSON-RPC span",
+			attrName: attr.RPCResponseStatusCode,
+			span:     nonJSONRPCSpan,
+			omitted:  true,
+		},
+		{
+			name:     "response status code - JSON-RPC span without error",
+			attrName: attr.RPCResponseStatusCode,
+			span: &Span{
+				SubType: HTTPSubtypeJSONRPC,
+				JSONRPC: &JSONRPC{Version: "2.0"},
+			},
+			omitted: true,
+		},
+		{
+			name:     "response status code - gRPC server span",
+			attrName: attr.RPCResponseStatusCode,
+			span: &Span{
+				Type:   EventTypeGRPC,
+				Status: 3,
+			},
+			expected: "INVALID_ARGUMENT",
+		},
+		{
+			name:     "response status code - gRPC span with leaked HTTP status is omitted",
+			attrName: attr.RPCResponseStatusCode,
+			span: &Span{
+				Type:   EventTypeGRPC,
+				Status: 200,
+			},
+			omitted: true,
+		},
+		{
+			name:     "response status code - gRPC client span with failed status read is omitted",
+			attrName: attr.RPCResponseStatusCode,
+			span: &Span{
+				Type:   EventTypeGRPCClient,
+				Status: 0xFFFF, // u16(-1) fallback from the eBPF side
+			},
+			omitted: true,
+		},
+		{
+			name:     "response status code - SunRPC success",
+			attrName: attr.RPCResponseStatusCode,
+			span: &Span{
+				Type:   EventTypeSunRPCClient,
+				Status: 0,
+			},
+			expected: "0",
+		},
+		{
+			name:     "response status code - SunRPC denied",
+			attrName: attr.RPCResponseStatusCode,
+			span: &Span{
+				Type:   EventTypeSunRPCServer,
+				Status: 1,
+			},
+			expected: "denied",
+		},
+		{
+			name:     "response status code - SunRPC proc unavail",
+			attrName: attr.RPCResponseStatusCode,
+			span: &Span{
+				Type:   EventTypeSunRPCClient,
+				Status: 4,
+			},
+			expected: "3",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			getter, ok := spanOTELGetters(tt.attrName)
+			require.True(t, ok, "getter should be found for %s", tt.attrName)
+
+			kv := getter(tt.span)
+			if tt.omitted {
+				assert.False(t, kv.Valid(), "attribute should be omitted, got %v", kv)
+				return
+			}
+			assert.Equal(t, string(tt.attrName), string(kv.Key))
+			assert.Equal(t, tt.expected, kv.Value.AsString())
+		})
+	}
+}
+
+func TestSpanOTELGetters_MCPAttributes(t *testing.T) {
+	mcpSpan := func(call *MCPCall) *Span {
+		return &Span{
+			Type:    EventTypeHTTP,
+			SubType: HTTPSubtypeMCP,
+			GenAI:   &GenAI{MCP: call},
+		}
+	}
+
+	// The parser fills ProtocolVer only for initialize, so every other method
+	// carries the zero value. That is the dominant shape, not an edge case.
+	toolsCall := mcpSpan(&MCPCall{Method: "tools/call", ToolName: "get-weather"})
+	initialize := mcpSpan(&MCPCall{Method: "initialize", ProtocolVer: "2025-06-18"})
+	resourceRead := mcpSpan(&MCPCall{
+		Method:      "resources/read",
+		ResourceURI: "file:///report.pdf",
+	})
+	promptGet := mcpSpan(&MCPCall{Method: "prompts/get", PromptName: "summarize"})
+	failedCall := mcpSpan(&MCPCall{Method: "tools/call", ErrorCode: -32602})
+
+	// MCP() returns nil unless the span is an MCP subtype carrying a parsed
+	// call, so each of these must omit every MCP attribute.
+	nonMCPSpan := &Span{Type: EventTypeHTTP}
+	noGenAISpan := &Span{Type: EventTypeHTTP, SubType: HTTPSubtypeMCP}
+	noCallSpan := &Span{Type: EventTypeHTTP, SubType: HTTPSubtypeMCP, GenAI: &GenAI{}}
+
+	tests := []struct {
+		name     string
+		attrName attr.Name
+		span     *Span
+		expected string
+		// omitted asserts the getter returns an invalid (zero) KeyValue so
+		// the attribute is dropped instead of being emitted empty.
+		omitted bool
+	}{
+		{
+			name:     "method name - MCP span",
+			attrName: attr.MCPMethodName,
+			span:     toolsCall,
+			expected: "tools/call",
+		},
+		{
+			name:     "method name - non-MCP span",
+			attrName: attr.MCPMethodName,
+			span:     nonMCPSpan,
+			omitted:  true,
+		},
+		{
+			name:     "method name - MCP subtype without GenAI",
+			attrName: attr.MCPMethodName,
+			span:     noGenAISpan,
+			omitted:  true,
+		},
+		{
+			name:     "method name - MCP subtype without a parsed call",
+			attrName: attr.MCPMethodName,
+			span:     noCallSpan,
+			omitted:  true,
+		},
+		{
+			name:     "protocol version - initialize",
+			attrName: attr.MCPProtocolVersion,
+			span:     initialize,
+			expected: "2025-06-18",
+		},
+		{
+			name:     "protocol version - method that does not negotiate one",
+			attrName: attr.MCPProtocolVersion,
+			span:     toolsCall,
+			omitted:  true,
+		},
+		{
+			name:     "protocol version - non-MCP span",
+			attrName: attr.MCPProtocolVersion,
+			span:     nonMCPSpan,
+			omitted:  true,
+		},
+		{
+			name:     "resource URI - resources/read",
+			attrName: attr.MCPResourceURI,
+			span:     resourceRead,
+			expected: "file:///report.pdf",
+		},
+		{
+			name:     "resource URI - method that names no resource",
+			attrName: attr.MCPResourceURI,
+			span:     toolsCall,
+			omitted:  true,
+		},
+		{
+			name:     "resource URI - non-MCP span",
+			attrName: attr.MCPResourceURI,
+			span:     nonMCPSpan,
+			omitted:  true,
+		},
+		{
+			name:     "tool name - tools/call",
+			attrName: attr.GenAIToolName,
+			span:     toolsCall,
+			expected: "get-weather",
+		},
+		{
+			name:     "tool name - method that names no tool",
+			attrName: attr.GenAIToolName,
+			span:     resourceRead,
+			omitted:  true,
+		},
+		{
+			name:     "tool name - non-MCP span",
+			attrName: attr.GenAIToolName,
+			span:     nonMCPSpan,
+			omitted:  true,
+		},
+		{
+			name:     "prompt name - prompts/get",
+			attrName: attr.GenAIPromptName,
+			span:     promptGet,
+			expected: "summarize",
+		},
+		{
+			name:     "prompt name - method that names no prompt",
+			attrName: attr.GenAIPromptName,
+			span:     toolsCall,
+			omitted:  true,
+		},
+		{
+			name:     "prompt name - non-MCP span",
+			attrName: attr.GenAIPromptName,
+			span:     nonMCPSpan,
+			omitted:  true,
+		},
+		{
+			name:     "response status code - MCP span with error",
+			attrName: attr.RPCResponseStatusCode,
+			span:     failedCall,
+			expected: "-32602",
+		},
+		{
+			name:     "response status code - MCP span without error",
+			attrName: attr.RPCResponseStatusCode,
+			span:     toolsCall,
+			omitted:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			getter, ok := spanOTELGetters(tt.attrName)
+			require.True(t, ok, "getter should be found for %s", tt.attrName)
+
+			kv := getter(tt.span)
+			if tt.omitted {
+				assert.False(t, kv.Valid(), "attribute should be omitted, got %v", kv)
+				return
+			}
+			assert.Equal(t, string(tt.attrName), string(kv.Key))
+			assert.Equal(t, tt.expected, kv.Value.AsString())
+		})
+	}
+}
+
+func TestSpanOTELGetters_DBQueryText(t *testing.T) {
+	getter, ok := spanOTELGetters(attr.DBQueryText)
+	require.True(t, ok, "getter should be found for DBQueryText")
+
+	tests := []struct {
+		name     string
+		span     *Span
+		expected string
+	}{
+		{
+			name: "SQL++ HTTP client span uses statement",
+			span: &Span{
+				Type:      EventTypeHTTPClient,
+				SubType:   HTTPSubtypeSQLPP,
+				Statement: "SELECT * FROM bucket.scope.collection",
+			},
+			expected: "SELECT * FROM bucket.scope.collection",
+		},
+		{
+			name: "SQL++ HTTP client span without statement returns empty",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				SubType: HTTPSubtypeSQLPP,
+			},
+			expected: "",
+		},
+		{
+			name: "Elasticsearch HTTP client span uses Elasticsearch query",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				SubType: HTTPSubtypeElasticsearch,
+				Elasticsearch: &Elasticsearch{
+					DBQueryText: `{"query":{"match_all":{}}}`,
+				},
+			},
+			expected: `{"query":{"match_all":{}}}`,
+		},
+		{
+			name: "Elasticsearch HTTP client span without Elasticsearch state returns empty",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				SubType: HTTPSubtypeElasticsearch,
+			},
+			expected: "",
+		},
+		{
+			name: "SQL++ subtype on non HTTP client span returns empty",
+			span: &Span{
+				Type:      EventTypeHTTP,
+				SubType:   HTTPSubtypeSQLPP,
+				Statement: "SELECT * FROM bucket",
+			},
+			expected: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var kv attribute.KeyValue
+			assert.NotPanics(t, func() { kv = getter(tt.span) })
+			assert.Equal(t, string(attr.DBQueryText), string(kv.Key))
+			assert.Equal(t, tt.expected, kv.Value.AsString())
+		})
+	}
+}
+
+func TestSpanOTELGetters_MessagingAttributes_NATS(t *testing.T) {
+	span := &Span{
+		Type:   EventTypeNATSClient,
+		Path:   "updates.orders",
+		Method: MessagingPublish,
+	}
+
+	systemGetter, ok := spanOTELGetters(attr.MessagingSystem)
+	require.True(t, ok, "getter should be found for MessagingSystem")
+	systemKV := systemGetter(span)
+	assert.Equal(t, string(attr.MessagingSystem), string(systemKV.Key))
+	assert.Equal(t, "nats", systemKV.Value.AsString())
+
+	destinationGetter, ok := spanOTELGetters(attr.MessagingDestination)
+	require.True(t, ok, "getter should be found for MessagingDestination")
+	destinationKV := destinationGetter(span)
+	assert.Equal(t, string(attr.MessagingDestination), string(destinationKV.Key))
+	assert.Equal(t, "updates.orders", destinationKV.Value.AsString())
+
+	opTypeGetter, ok := spanOTELGetters(attr.MessagingOpType)
+	require.True(t, ok, "getter should be found for MessagingOpType")
+	assert.Equal(t, MessagingSend, opTypeGetter(span).Value.AsString())
+
+	span.Method = MessagingProcess
+	assert.Equal(t, MessagingProcess, opTypeGetter(span).Value.AsString())
+}
+
+// AMQP spans carry no destination: the attribute is omitted, not emitted empty.
+func TestSpanOTELGetters_MessagingDestinationOmittedWhenUnknown(t *testing.T) {
+	getter, ok := spanOTELGetters(attr.MessagingDestination)
+	require.True(t, ok)
+
+	assert.False(t, getter(&Span{Type: EventTypeAMQPClient, Method: MessagingPublish}).Valid())
+	assert.False(t, getter(&Span{Type: EventTypeKafkaClient}).Valid())
+	assert.Equal(t, "orders", getter(&Span{Type: EventTypeKafkaClient, Path: "orders"}).Value.AsString())
+}
+
+func TestSpanOTELGetters_MessagingSubscription(t *testing.T) {
+	getter, ok := spanOTELGetters(attr.MessagingSubscription)
+	require.True(t, ok)
+
+	subscribe := &Span{Type: EventTypeMQTTClient, Method: MessagingProcess, MessagingInfo: &MessagingInfo{SubscriptionName: "sensors/#"}}
+	kv := getter(subscribe)
+	require.True(t, kv.Valid())
+	assert.Equal(t, string(attr.MessagingSubscription), string(kv.Key))
+	assert.Equal(t, "sensors/#", kv.Value.AsString())
+	assert.Equal(t, "sensors/#", spanPromGetters(attr.MessagingSubscription)(subscribe))
+
+	for _, span := range []*Span{
+		{Type: EventTypeMQTTClient, Method: MessagingPublish, Path: "sensors/1"},
+		{Type: EventTypeKafkaClient, Method: MessagingProcess, MessagingInfo: &MessagingInfo{ConsumerGroup: "g"}},
+	} {
+		assert.False(t, getter(span).Valid())
+		assert.Empty(t, spanPromGetters(attr.MessagingSubscription)(span))
+	}
+}
+
+// TestSpanOTELGetters_MessagingOpTypeOmitted ensures messaging.operation.type
+// (a semconv enum) is omitted — not emitted as an empty string — when the
+// operation is unknown or the span is not a messaging span.
+func TestSpanOTELGetters_MessagingOpTypeOmitted(t *testing.T) {
+	opTypeGetter, ok := spanOTELGetters(attr.MessagingOpType)
+	require.True(t, ok, "getter should be found for MessagingOpType")
+
+	// messaging span with an unknown operation
+	kv := opTypeGetter(&Span{Type: EventTypeKafkaClient})
+	assert.False(t, kv.Valid(), "attribute should be omitted, got %v", kv)
+
+	// SQS span whose operation type was not recognized
+	kv = opTypeGetter(&Span{
+		Type:    EventTypeHTTPClient,
+		SubType: HTTPSubtypeAWSSQS,
+		AWS:     &AWS{},
+	})
+	assert.False(t, kv.Valid(), "attribute should be omitted, got %v", kv)
+
+	// non-messaging span
+	kv = opTypeGetter(&Span{Type: EventTypeHTTP})
+	assert.False(t, kv.Valid(), "attribute should be omitted, got %v", kv)
+}
+
+// TestSpanOTELGetters_ErrorTypeOmitted ensures error.type is omitted — not
+// emitted as an empty string — on successful requests, while failed requests
+// keep their error.type value.
+func TestSpanOTELGetters_ErrorTypeOmitted(t *testing.T) {
+	getter, ok := spanOTELGetters(attr.ErrorType)
+	require.True(t, ok, "getter should be found for ErrorType")
+
+	// successful HTTP request: no error.type
+	kv := getter(&Span{Type: EventTypeHTTP, Status: 200})
+	assert.False(t, kv.Valid(), "attribute should be omitted, got %v", kv)
+
+	// failed HTTP request: the status code classifies the failure
+	kv = getter(&Span{Type: EventTypeHTTP, Status: 500})
+	require.True(t, kv.Valid())
+	assert.Equal(t, string(attr.ErrorType), string(kv.Key))
+	assert.Equal(t, "500", kv.Value.AsString())
+
+	// failed Memcached request keeps its specific error code
+	kv = getter(&Span{
+		Type:    EventTypeMemcachedClient,
+		Status:  1,
+		DBError: DBError{ErrorCode: "SERVER_ERROR"},
+	})
+	require.True(t, kv.Valid())
+	assert.Equal(t, "SERVER_ERROR", kv.Value.AsString())
+}
+
+func TestSpanGetters_ErrorTypeOnHTTPSpans(t *testing.T) {
+	otelGetter, ok := spanOTELGetters(attr.ErrorType)
+	require.True(t, ok)
+	promGetter := spanPromGetters(attr.ErrorType)
+	require.NotNil(t, promGetter)
+
+	for _, tc := range []struct {
+		name     string
+		span     *Span
+		expected string
+	}{
+		{name: "server 200", span: &Span{Type: EventTypeHTTP, Status: 200}, expected: ""},
+		{name: "server 404", span: &Span{Type: EventTypeHTTP, Status: 404}, expected: ""},
+		{name: "server 500", span: &Span{Type: EventTypeHTTP, Status: 500}, expected: "500"},
+		{name: "server 503", span: &Span{Type: EventTypeHTTP, Status: 503}, expected: "503"},
+		{name: "server no response", span: &Span{Type: EventTypeHTTP, Status: 500, ResponseObservation: ResponseSilent}, expected: ""},
+		{name: "client 200", span: &Span{Type: EventTypeHTTPClient, Status: 200}, expected: ""},
+		{name: "client 404", span: &Span{Type: EventTypeHTTPClient, Status: 404}, expected: "404"},
+		{name: "client 500", span: &Span{Type: EventTypeHTTPClient, Status: 500}, expected: "500"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			kv := otelGetter(tc.span)
+			if tc.expected == "" {
+				assert.False(t, kv.Valid(), "attribute should be omitted, got %v", kv)
+			} else {
+				require.True(t, kv.Valid())
+				assert.Equal(t, string(attr.ErrorType), string(kv.Key))
+				assert.Equal(t, tc.expected, kv.Value.AsString())
+			}
+			assert.Equal(t, tc.expected, promGetter(tc.span))
+		})
+	}
+}
+
+func TestSpanGettersForHTTP_ErrorTypeIgnoresProtocolCodes(t *testing.T) {
+	otelGetter, ok := SpanOTELGettersForHTTP(UnresolvedNames{})(attr.ErrorType)
+	require.True(t, ok)
+	promGetter, ok := SpanPromGettersForHTTP(UnresolvedNames{})(attr.ErrorType)
+	require.True(t, ok)
+
+	for _, tc := range []struct {
+		name     string
+		span     *Span
+		expected string
+	}{
+		{name: "json-rpc error in 200", span: &Span{Type: EventTypeHTTP, SubType: HTTPSubtypeJSONRPC, Status: 200, JSONRPC: &JSONRPC{ErrorCode: -32601}}, expected: ""},
+		{name: "mcp error in 200", span: &Span{Type: EventTypeHTTP, SubType: HTTPSubtypeMCP, Status: 200, GenAI: &GenAI{MCP: &MCPCall{ErrorCode: -32602}}}, expected: ""},
+		{name: "sns batch failure in 200", span: &Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeAWSSNS, Status: 200, AWS: &AWS{SNS: AWSSNS{ErrorCode: "InvalidParameter"}}}, expected: ""},
+		{name: "json-rpc error in 500", span: &Span{Type: EventTypeHTTP, SubType: HTTPSubtypeJSONRPC, Status: 500, JSONRPC: &JSONRPC{ErrorCode: -32603}}, expected: "500"},
+		{name: "server 404", span: &Span{Type: EventTypeHTTP, Status: 404}, expected: ""},
+		{name: "client 404", span: &Span{Type: EventTypeHTTPClient, Status: 404}, expected: "404"},
+		{name: "server no response", span: &Span{Type: EventTypeHTTP, Status: 500, ResponseObservation: ResponseSilent}, expected: ""},
+		{name: "no status", span: &Span{Type: EventTypeHTTPClient}, expected: ErrorTypeOther},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			kv := otelGetter(tc.span)
+			if tc.expected == "" {
+				assert.False(t, kv.Valid(), "attribute should be omitted, got %v", kv)
+			} else {
+				require.True(t, kv.Valid())
+				assert.Equal(t, tc.expected, kv.Value.AsString())
+			}
+			assert.Equal(t, tc.expected, promGetter(tc.span))
+		})
+	}
+}
+
+// TestSpanOTELGetters_GenAIOperationNameClamped ensures gen_ai.operation.name
+// clamps to _OTHER — not an empty string — on a GenAI span whose operation
+// could not be derived, stays absent on spans that carry no GenAI data, and
+// keeps classified operations.
+func TestSpanOTELGetters_GenAIOperationNameClamped(t *testing.T) {
+	getter, ok := spanOTELGetters(attr.GenAIOperationName)
+	require.True(t, ok, "getter should be found for GenAIOperationName")
+
+	// non-GenAI span
+	kv := getter(&Span{Type: EventTypeHTTPClient})
+	assert.False(t, kv.Valid(), "attribute should be omitted, got %v", kv)
+
+	// GenAI span whose operation was not classified
+	kv = getter(&Span{
+		Type:    EventTypeHTTPClient,
+		SubType: HTTPSubtypeOpenAI,
+		GenAI:   &GenAI{OpenAI: &VendorOpenAI{}},
+	})
+	require.True(t, kv.Valid())
+	assert.Equal(t, OtherOperationName, kv.Value.AsString())
+
+	// classified GenAI span keeps its operation name
+	kv = getter(&Span{
+		Type:    EventTypeHTTPClient,
+		SubType: HTTPSubtypeOpenAI,
+		GenAI:   &GenAI{OpenAI: &VendorOpenAI{OperationName: ChatOperationName}},
+	})
+	require.True(t, kv.Valid())
+	assert.Equal(t, ChatOperationName, kv.Value.AsString())
+}
+
+// TestSpanOTELGetters_GenAIProviderNameOmitted ensures gen_ai.provider.name
+// (a semconv enum) is omitted — not emitted as an empty string — on spans
+// with no detected GenAI provider.
+func TestSpanOTELGetters_GenAIProviderNameOmitted(t *testing.T) {
+	getter, ok := spanOTELGetters(attr.GenAIProviderName)
+	require.True(t, ok, "getter should be found for GenAIProviderName")
+
+	// non-GenAI span
+	kv := getter(&Span{Type: EventTypeHTTPClient})
+	assert.False(t, kv.Valid(), "attribute should be omitted, got %v", kv)
+
+	// GenAI span keeps its provider
+	kv = getter(&Span{
+		Type:    EventTypeHTTPClient,
+		SubType: HTTPSubtypeOpenAI,
+		GenAI:   &GenAI{OpenAI: &VendorOpenAI{}},
+	})
+	require.True(t, kv.Valid())
+	assert.Equal(t, "openai", kv.Value.AsString())
+}
+
+func TestSpanOTELGetters_DBSystemNameOmitted(t *testing.T) {
+	getter, ok := spanOTELGetters(attr.DBSystemName)
+	require.True(t, ok, "getter should be found for DBSystemName")
+
+	kv := getter(&Span{Type: EventTypeHTTP})
+	assert.False(t, kv.Valid(), "attribute should be omitted, got %v", kv)
+
+	kv = getter(&Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeElasticsearch})
+	assert.False(t, kv.Valid(), "attribute should be omitted, got %v", kv)
+
+	kv = getter(&Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeSQLPP})
+	assert.False(t, kv.Valid(), "attribute should be omitted, got %v", kv)
+
+	kv = getter(&Span{
+		Type:          EventTypeHTTPClient,
+		SubType:       HTTPSubtypeElasticsearch,
+		Elasticsearch: &Elasticsearch{DBSystemName: "elasticsearch"},
+	})
+	require.True(t, kv.Valid())
+	assert.Equal(t, "elasticsearch", kv.Value.AsString())
+
+	kv = getter(&Span{Type: EventTypeRedisClient})
+	require.True(t, kv.Valid())
+	assert.Equal(t, "redis", kv.Value.AsString())
+}
+
+func TestSpanOTELGetters_MessagingSystemOmitted(t *testing.T) {
+	getter, ok := spanOTELGetters(attr.MessagingSystem)
+	require.True(t, ok, "getter should be found for MessagingSystem")
+
+	kv := getter(&Span{Type: EventTypeHTTP})
+	assert.False(t, kv.Valid(), "attribute should be omitted, got %v", kv)
+
+	kv = getter(&Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeAWSSQS})
+	assert.False(t, kv.Valid(), "attribute should be omitted, got %v", kv)
+
+	kv = getter(&Span{Type: EventTypeKafkaClient})
+	require.True(t, kv.Valid())
+	assert.Equal(t, "kafka", kv.Value.AsString())
+}
+
+func TestSpanOTELGetters_GenAIInput(t *testing.T) {
+	tests := []struct {
+		name     string
+		span     *Span
+		expected string
+	}{
+		{
+			name: "openai",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				SubType: HTTPSubtypeOpenAI,
+				GenAI: &GenAI{OpenAI: &VendorOpenAI{Request: OpenAIInput{
+					Messages: json.RawMessage(`[{"role":"user","content":"hi"}]`),
+				}}},
+			},
+			expected: `[{"role":"user","parts":[{"type":"text","content":"hi"}]}]`,
+		},
+		{
+			name: "anthropic",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				SubType: HTTPSubtypeAnthropic,
+				GenAI: &GenAI{Anthropic: &VendorAnthropic{Input: AnthropicRequest{
+					Messages: json.RawMessage(`[{"role":"user","content":"hello"}]`),
+				}}},
+			},
+			expected: `[{"role":"user","parts":[{"type":"text","content":"hello"}]}]`,
+		},
+		{
+			name: "qwen",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				SubType: HTTPSubtypeQwen,
+				GenAI: &GenAI{Qwen: &VendorOpenAI{Request: OpenAIInput{
+					Messages: json.RawMessage(`[{"role":"user","content":"hey"}]`),
+				}}},
+			},
+			expected: `[{"role":"user","parts":[{"type":"text","content":"hey"}]}]`,
+		},
+		{
+			name: "bedrock",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				SubType: HTTPSubtypeAWSBedrock,
+				GenAI: &GenAI{Bedrock: &VendorBedrock{Input: BedrockRequest{
+					Messages: json.RawMessage(`[{"role":"user","content":"howdy"}]`),
+				}}},
+			},
+			expected: `[{"role":"user","parts":[{"type":"text","content":"howdy"}]}]`,
+		},
+		{
+			name:     "no genai",
+			span:     &Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeOpenAI},
+			expected: "",
+		},
+	}
+
+	getter, ok := spanOTELGetters(attr.GenAIInput)
+	require.True(t, ok)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, getter(tt.span).Value.AsString())
+		})
+	}
+}
+
+func TestSpanOTELGetters_GenAIOutput(t *testing.T) {
+	tests := []struct {
+		name     string
+		span     *Span
+		expected string
+	}{
+		{
+			name: "anthropic",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				SubType: HTTPSubtypeAnthropic,
+				GenAI: &GenAI{Anthropic: &VendorAnthropic{Output: AnthropicResponse{
+					Role:       "assistant",
+					Content:    json.RawMessage(`[{"type":"text","text":"hello"}]`),
+					StopReason: "end_turn",
+				}}},
+			},
+			expected: `[{"role":"assistant","parts":[{"type":"text","content":"hello"}],"finish_reason":"end_turn"}]`,
+		},
+		{
+			name: "bedrock anthropic format",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				SubType: HTTPSubtypeAWSBedrock,
+				GenAI: &GenAI{Bedrock: &VendorBedrock{Output: BedrockResponse{
+					Content:    json.RawMessage(`[{"type":"text","text":"hi from bedrock"}]`),
+					StopReason: "end_turn",
+				}}},
+			},
+			expected: `[{"role":"assistant","parts":[{"type":"text","content":"hi from bedrock"}],"finish_reason":"end_turn"}]`,
+		},
+		{
+			name: "bedrock llama format",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				SubType: HTTPSubtypeAWSBedrock,
+				GenAI: &GenAI{Bedrock: &VendorBedrock{Output: BedrockResponse{
+					Generation: "llama says hi",
+					StopReason: "stop",
+				}}},
+			},
+			expected: `[{"role":"assistant","parts":[{"type":"text","content":"llama says hi"}],"finish_reason":"stop"}]`,
+		},
+		{
+			name:     "no genai",
+			span:     &Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeAnthropic},
+			expected: "",
+		},
+		{
+			// gen_ai.output.messages must be suppressed for embeddings to
+			// stay aligned with the tracesgen path.
+			name: "openai embeddings suppressed",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				SubType: HTTPSubtypeOpenAI,
+				GenAI: &GenAI{OpenAI: &VendorOpenAI{
+					OperationName: EmbeddingOperationName,
+					Data:          json.RawMessage(`[{"object":"embedding","embedding":[0.1,0.2]}]`),
+				}},
+			},
+			expected: "",
+		},
+		{
+			name: "qwen embeddings suppressed",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				SubType: HTTPSubtypeQwen,
+				GenAI: &GenAI{Qwen: &VendorOpenAI{
+					OperationName: EmbeddingOperationName,
+					Data:          json.RawMessage(`[{"object":"embedding","embedding":[0.1]}]`),
+				}},
+			},
+			expected: "",
+		},
+	}
+
+	getter, ok := spanOTELGetters(attr.GenAIOutput)
+	require.True(t, ok)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, getter(tt.span).Value.AsString())
+		})
+	}
+}
+
+func TestSpanOTELGetters_GenAIInstructions(t *testing.T) {
+	tests := []struct {
+		name     string
+		span     *Span
+		expected string
+	}{
+		{
+			name: "openai",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				SubType: HTTPSubtypeOpenAI,
+				GenAI: &GenAI{OpenAI: &VendorOpenAI{Request: OpenAIInput{
+					Instructions: "be concise",
+				}}},
+			},
+			expected: `[{"type":"text","content":"be concise"}]`,
+		},
+		{
+			name: "anthropic",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				SubType: HTTPSubtypeAnthropic,
+				GenAI: &GenAI{Anthropic: &VendorAnthropic{Input: AnthropicRequest{
+					System: "you are helpful",
+				}}},
+			},
+			expected: `[{"type":"text","content":"you are helpful"}]`,
+		},
+		{
+			name: "qwen",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				SubType: HTTPSubtypeQwen,
+				GenAI: &GenAI{Qwen: &VendorOpenAI{Request: OpenAIInput{
+					Instructions: "respond in english",
+				}}},
+			},
+			expected: `[{"type":"text","content":"respond in english"}]`,
+		},
+		{
+			name: "openai empty instructions",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				SubType: HTTPSubtypeOpenAI,
+				GenAI:   &GenAI{OpenAI: &VendorOpenAI{}},
+			},
+			expected: "",
+		},
+	}
+
+	getter, ok := spanOTELGetters(attr.GenAIInstructions)
+	require.True(t, ok)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, getter(tt.span).Value.AsString())
+		})
+	}
+}
+
+func TestSpanOTELGetters_GenAITools(t *testing.T) {
+	openAITools := json.RawMessage(`[{"type":"function","function":{"name":"get_weather","description":"get weather","parameters":{"type":"object"}}}]`)
+	anthropicTools := json.RawMessage(`[{"name":"get_weather","description":"get weather","input_schema":{"type":"object"}}]`)
+	geminiTools := json.RawMessage(`[{"functionDeclarations":[{"name":"get_weather","description":"get weather","parameters":{"type":"object"}}]}]`)
+	expectedNormalized := `[{"type":"function","name":"get_weather","description":"get weather","parameters":{"type":"object"}}]`
+
+	tests := []struct {
+		name     string
+		span     *Span
+		expected string
+	}{
+		{
+			name: "openai",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				SubType: HTTPSubtypeOpenAI,
+				GenAI: &GenAI{OpenAI: &VendorOpenAI{Request: OpenAIInput{
+					Tools: openAITools,
+				}}},
+			},
+			expected: expectedNormalized,
+		},
+		{
+			name: "anthropic",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				SubType: HTTPSubtypeAnthropic,
+				GenAI: &GenAI{Anthropic: &VendorAnthropic{Input: AnthropicRequest{
+					Tools: anthropicTools,
+				}}},
+			},
+			expected: expectedNormalized,
+		},
+		{
+			name: "gemini",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				SubType: HTTPSubtypeGemini,
+				GenAI: &GenAI{Gemini: &VendorGemini{Input: GeminiRequest{
+					Tools: geminiTools,
+				}}},
+			},
+			expected: expectedNormalized,
+		},
+		{
+			name: "qwen",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				SubType: HTTPSubtypeQwen,
+				GenAI: &GenAI{Qwen: &VendorOpenAI{Request: OpenAIInput{
+					Tools: openAITools,
+				}}},
+			},
+			expected: expectedNormalized,
+		},
+		{
+			name: "bedrock",
+			span: &Span{
+				Type:    EventTypeHTTPClient,
+				SubType: HTTPSubtypeAWSBedrock,
+				GenAI: &GenAI{Bedrock: &VendorBedrock{Input: BedrockRequest{
+					Tools: anthropicTools,
+				}}},
+			},
+			expected: expectedNormalized,
+		},
+		{
+			name:     "no genai",
+			span:     &Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeAnthropic},
+			expected: "",
+		},
+	}
+
+	getter, ok := spanOTELGetters(attr.GenAITools)
+	require.True(t, ok)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, getter(tt.span).Value.AsString())
+		})
+	}
+}
+
+func TestSpanOTELGetters_Instance(t *testing.T) {
+	getter, ok := spanOTELGetters(attr.Instance)
+	require.True(t, ok, "getter should be found for Instance")
+
+	span := &Span{
+		Service: svc.Attrs{
+			UID: svc.UID{
+				Instance: "instance-42",
+			},
+		},
+	}
+
+	kv := getter(span)
+	assert.Equal(t, string(attr.Instance), string(kv.Key))
+	assert.Equal(t, "instance-42", kv.Value.AsString())
+}
+
+func TestDBClientServerPortGetter(t *testing.T) {
+	postgres := func(port int, host string) *Span {
+		return &Span{Type: EventTypeSQLClient, SubType: int(DBPostgres), HostPort: port, Host: host}
+	}
+	tests := []struct {
+		name     string
+		explicit bool
+		span     *Span
+		expected int
+		omitted  bool
+	}{
+		{
+			name:     "default selection, non-default port with address",
+			span:     postgres(5433, "dbhost"),
+			expected: 5433,
+		},
+		{
+			name:    "default selection, DBMS default port",
+			span:    postgres(5432, "dbhost"),
+			omitted: true,
+		},
+		{
+			name:    "default selection, known port without address",
+			span:    postgres(5433, ""),
+			omitted: true,
+		},
+		{
+			name:    "default selection, unknown port",
+			span:    postgres(0, "dbhost"),
+			omitted: true,
+		},
+		{
+			name:    "default selection, redis default port",
+			span:    &Span{Type: EventTypeRedisClient, HostPort: 6379, Host: "cache"},
+			omitted: true,
+		},
+		{
+			name:     "default selection, no known default for the DBMS",
+			span:     &Span{Type: EventTypeSQLClient, HostPort: 5432, Host: "dbhost"},
+			expected: 5432,
+		},
+		{
+			name:     "explicit inclusion, DBMS default port",
+			explicit: true,
+			span:     postgres(5432, "dbhost"),
+			expected: 5432,
+		},
+		{
+			name:     "explicit inclusion, known port without address",
+			explicit: true,
+			span:     postgres(5433, ""),
+			expected: 5433,
+		},
+		{
+			name:     "explicit inclusion, unknown port",
+			explicit: true,
+			span:     postgres(0, "dbhost"),
+			omitted:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			kv := dbClientServerPortGetter(tt.explicit)(tt.span)
+			if tt.omitted {
+				assert.False(t, kv.Valid(), "expected server.port to be omitted, got %v", kv)
+				return
+			}
+			require.True(t, kv.Valid(), "expected server.port to be reported")
+			assert.Equal(t, string(attr.ServerPort), string(kv.Key))
+			assert.Equal(t, int64(tt.expected), kv.Value.AsInt64())
+		})
+	}
+}
+
+func TestSpanOTELGetters_DBNamespace(t *testing.T) {
+	getter, ok := spanOTELGetters(attr.DBNamespace)
+	require.True(t, ok, "getter should be found for DBNamespace")
+
+	kv := getter(&Span{Type: EventTypeRedisClient, DBNamespace: "1"})
+	require.True(t, kv.Valid())
+	assert.Equal(t, string(attr.DBNamespace), string(kv.Key))
+	assert.Equal(t, "1", kv.Value.AsString())
+
+	kv = getter(&Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeElasticsearch, DBNamespace: "cluster-a", Elasticsearch: &Elasticsearch{DBSystemName: "elasticsearch"}})
+	require.True(t, kv.Valid())
+	assert.Equal(t, "cluster-a", kv.Value.AsString())
+
+	kv = getter(&Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeElasticsearch, Elasticsearch: &Elasticsearch{DBSystemName: "elasticsearch"}})
+	assert.False(t, kv.Valid(), "expected db.namespace to be omitted, got %v", kv)
+
+	// spans without an available namespace must omit the attribute
+	// instead of emitting an empty value
+	kv = getter(&Span{Type: EventTypeSQLClient, SubType: int(DBMySQL)})
+	assert.False(t, kv.Valid(), "expected db.namespace to be omitted, got %v", kv)
+}
+
+func TestSpanOTELGetters_DBResponseStatusCode(t *testing.T) {
+	getter, ok := spanOTELGetters(attr.DBResponseStatusCode)
+	require.True(t, ok, "getter should be found for DBResponseStatusCode")
+
+	tests := []struct {
+		name     string
+		span     *Span
+		expected string
+	}{
+		{
+			name:     "failed SQL operation reports the vendor error code",
+			span:     &Span{Type: EventTypeSQLClient, Status: 1, SQLError: &SQLError{Code: 1146}},
+			expected: "1146",
+		},
+		{
+			name:     "failed postgres operation reports the SQLSTATE (no vendor code in the protocol)",
+			span:     &Span{Type: EventTypeSQLClient, Status: 1, SQLError: &SQLError{SQLState: "08P01"}},
+			expected: "08P01",
+		},
+		{
+			name:     "failed redis operation reports the protocol error code",
+			span:     &Span{Type: EventTypeRedisClient, DBError: DBError{ErrorCode: "WRONGTYPE"}},
+			expected: "WRONGTYPE",
+		},
+		{
+			name:     "failed elasticsearch operation reports the HTTP status code",
+			span:     &Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeElasticsearch, Status: 404},
+			expected: "404",
+		},
+		{
+			name:     "successful elasticsearch operation also reports the HTTP status code",
+			span:     &Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeElasticsearch, Status: 200},
+			expected: "200",
+		},
+		{
+			name: "elasticsearch operation without a response omits the attribute",
+			span: &Span{Type: EventTypeHTTPClient, SubType: HTTPSubtypeElasticsearch},
+		},
+		{
+			name: "successful operation omits the attribute",
+			span: &Span{Type: EventTypeSQLClient},
+		},
+		{
+			name: "SQL error data without failure status omits the attribute",
+			span: &Span{Type: EventTypeSQLClient, SQLError: &SQLError{Code: 1146}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			kv := getter(tt.span)
+			if tt.expected == "" {
+				assert.False(t, kv.Valid(), "expected db.response.status_code to be omitted, got %v", kv)
+				return
+			}
+			require.True(t, kv.Valid(), "expected db.response.status_code to be reported")
+			assert.Equal(t, string(attr.DBResponseStatusCode), string(kv.Key))
+			assert.Equal(t, tt.expected, kv.Value.AsString())
+		})
+	}
+}
+
+func TestSpanOTELGetters_MessagingConsumerGroup(t *testing.T) {
+	getter, ok := spanOTELGetters(attr.MessagingConsumerGroup)
+	require.True(t, ok, "getter should be found for MessagingConsumerGroup")
+
+	consumer := &Span{Type: EventTypeKafkaClient, Method: MessagingProcess, MessagingInfo: &MessagingInfo{ConsumerGroup: "my-group"}}
+	kv := getter(consumer)
+	require.True(t, kv.Valid())
+	assert.Equal(t, string(attr.MessagingConsumerGroup), string(kv.Key))
+	assert.Equal(t, "my-group", kv.Value.AsString())
+
+	// unknown group and producers: attribute omitted, Prometheus label empty
+	for _, span := range []*Span{
+		{Type: EventTypeKafkaClient, Method: MessagingProcess, MessagingInfo: &MessagingInfo{}},
+		{Type: EventTypeKafkaClient, Method: MessagingSend},
+	} {
+		assert.False(t, getter(span).Valid())
+		assert.Empty(t, spanPromGetters(attr.MessagingConsumerGroup)(span))
+	}
+	assert.Equal(t, "my-group", spanPromGetters(attr.MessagingConsumerGroup)(consumer))
+}

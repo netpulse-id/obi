@@ -1,0 +1,100 @@
+# Kernel matrix for OBI VM integration tests.
+#
+# All entries come from cilium/little-vm-helper-images
+# (quay.io/lvh-images/kernel-images:<lvh_tag>).
+# Pulls are always content-addressed: every entry must carry both `lvh_tag`
+# (human-readable, used in paths/keys) and `digest` (what docker actually
+# resolves). This defends against an attacker re-pushing a dated LVH tag.
+# Renovate keeps both fields in sync; do not hand-edit one without the other.
+#
+# Fields:
+#   id              human-readable identifier (used in matrix output + paths)
+#   lvh_tag         exact LVH tag, e.g. "6.12-20260504.013701"
+#   digest          REQUIRED sha256 manifest digest for <lvh_tag> on quay.io,
+#                   format "sha256:<64-hex>". To regenerate manually:
+#                     docker buildx imagetools inspect \
+#                       quay.io/lvh-images/kernel-images:<lvh_tag> \
+#                       --format '{{json .Manifest.Digest}}'
+#   pr_integration  include in PR VM integration matrix
+#   pr_verifier     include in PR BPF verifier matrix
+
+kernels:
+  - id: "5.10-lts"
+    lvh_tag: "5.10-20261012.013942"
+    digest: "sha256:7c3f19d851f53977d08e59aa06bc723ccdd077e803507fddc24f80d7a8292369"
+    pr_integration: false
+    pr_verifier: true
+
+  # Same 5.10 kernel; boots cgroupv1-only to exercise self-mount.
+  - id: "5.10-lts-cgv1"
+    lvh_tag: "5.10-20261012.013942"
+    digest: "sha256:7c3f19d851f53977d08e59aa06bc723ccdd077e803507fddc24f80d7a8292369"
+    pr_integration: false
+    pr_verifier: false
+    cgroup_mode: "legacy"
+
+  - id: "5.15-lts"
+    lvh_tag: "5.15-20261012.013942"
+    digest: "sha256:e94ae6e5fa316568120607448d03d3a95d8fafe8409c7698d9a8a29b70f5c342"
+    pr_integration: true
+    pr_verifier: true
+
+  - id: "6.1-lts"
+    lvh_tag: "6.1-20261012.013942"
+    digest: "sha256:cf67213611775705fdbe12b7ed1ca204e05bd3df3f53dbf39fb6b87c6a024f7f"
+    pr_integration: false
+    pr_verifier: true
+
+  - id: "6.6-lts"
+    lvh_tag: "6.6-20261012.013942"
+    digest: "sha256:33e96bdd2caecbfe9b9c527e97937453c086cd6b6ccf362e91e76c371aa67872"
+    pr_integration: false
+    pr_verifier: true
+
+  - id: "6.12-lts"
+    lvh_tag: "6.12-20261012.013942"
+    digest: "sha256:afd1ab5cf8d2dbb1d8e60a8723d3780b83ebac29a2e871c53cdcdd4ee57fa034"
+    pr_integration: false
+    pr_verifier: true
+
+  - id: "6.18-lts"
+    lvh_tag: "6.18-20261012.013942"
+    digest: "sha256:4dfa5e0027048b375faf09d2359532ac2f666ff90fe198519bfe2391180d26ef"
+    pr_integration: true
+    pr_verifier: true
+
+  - id: "7.2"
+    lvh_tag: "7.2-20261012.013942"
+    digest: "sha256:b154dafcfe751fdb2f161b7073b691a669b9faa00b7597873277aa7ab9d9358f"
+    pr_integration: true
+    pr_verifier: true
+
+  - id: "bpf"
+    lvh_tag: "bpf-20261012.013942"
+    digest: "sha256:1479eae8178ed73bb43799e379733abdb9e62ca721706891aad272c8b2b130c8"
+    pr_integration: false
+    pr_verifier: true
+
+  - id: "bpf-next"
+    lvh_tag: "bpf-next-20261012.013942"
+    digest: "sha256:5da4496c3a49f6529397154d73903788816788e3b2ce6ca39a5e4693262d93ea"
+    pr_integration: false
+    pr_verifier: true
+
+  - id: "rhel8.9"
+    lvh_tag: "rhel8.9-20261012.013942"
+    digest: "sha256:d8b5ab4b6d536d80d79a863a5a8108c5c7e63dc2df67e7114160b2fc984ba575"
+    pr_integration: false
+    pr_verifier: true
+
+  - id: "rhel8.10"
+    lvh_tag: "rhel8.10-20261012.013942"
+    digest: "sha256:27fc82ac9505106d3b5d8177dfb06727bfdc754497ddf907c1baabb3adbace86"
+    pr_integration: false
+    pr_verifier: true
+
+  - id: "rhel9.6"
+    lvh_tag: "rhel9.6-20261012.013942"
+    digest: "sha256:1e92e8c39a0651193ee52444c973d4cf61177d6030546fa6e59c11c5f5e4b5f2"
+    pr_integration: false
+    pr_verifier: true

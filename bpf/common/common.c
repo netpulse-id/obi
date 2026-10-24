@@ -1,0 +1,43 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+//go:build obi_bpf_ignore
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include <common/common.h>
+#include <common/event_defs.h>
+#include <common/ringbuf_types.h>
+
+#include <pid/types/pid_filter.h>
+
+// Force emitting these types into the ELF so bpf2go generates their Go
+// counterparts (structs, and constants for enums)
+const http_request_trace_t *unused_4 __attribute__((unused));
+const sql_request_trace_t *unused_3 __attribute__((unused));
+const tcp_req_t *unused_5 __attribute__((unused));
+const kafka_client_req_t *unused_6 __attribute__((unused));
+const redis_client_req_t *unused_7 __attribute__((unused));
+const kafka_go_req_t *unused_8 __attribute__((unused));
+const tcp_large_buffer_t *unused_9 __attribute__((unused));
+const otel_span_t *unused_10 __attribute__((unused));
+const mongo_go_client_req_t *unused_11 __attribute__((unused));
+const dns_req_t *unused_12 __attribute__((unused));
+const channel_link_trace_t *unused_13 __attribute__((unused));
+const go_auto_span_t *unused_14 __attribute__((unused));
+const node_span_event_t *unused_15 __attribute__((unused));
+const enum protocol_type *unused_16 __attribute__((unused));
+const enum event_type *unused_17 __attribute__((unused));
+const enum pid_namespace_mode *unused_18 __attribute__((unused));
+const enum valid_pids_size *unused_19 __attribute__((unused));
+const ringbuf_write_stats_t *unused_20 __attribute__((unused));
+const enum ringbuf_id *unused_21 __attribute__((unused));

@@ -1,0 +1,478 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package integration // import "go.opentelemetry.io/obi/internal/test/integration"
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	neturl "net/url"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"go.opentelemetry.io/obi/internal/test/integration/components/jaeger"
+	"go.opentelemetry.io/obi/internal/test/integration/components/promtest"
+)
+
+// mcpCall sends a JSON-RPC 2.0 MCP request over HTTP and returns the response.
+// Optional headers are applied as key-value pairs to the outgoing request.
+func mcpCall(url, method string, id int, params any, headers ...string) (*http.Response, error) {
+	reqBody := map[string]any{
+		"jsonrpc": "2.0",
+		"method":  method,
+		"id":      id,
+	}
+	if params != nil {
+		reqBody["params"] = params
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body)) //nolint:noctx
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	for i := 0; i+1 < len(headers); i += 2 {
+		req.Header.Set(headers[i], headers[i+1])
+	}
+	return http.DefaultClient.Do(req)
+}
+
+// mcpNotify sends a JSON-RPC 2.0 notification (no id, no response expected).
+func mcpNotify(url, method string, params any, headers ...string) error {
+	reqBody := map[string]any{
+		"jsonrpc": "2.0",
+		"method":  method,
+	}
+	if params != nil {
+		reqBody["params"] = params
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body)) //nolint:noctx
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	for i := 0; i+1 < len(headers); i += 2 {
+		req.Header.Set(headers[i], headers[i+1])
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	return nil
+}
+
+// mcpInitSession performs the MCP initialization handshake and returns the
+// session ID assigned by the server. It retries until the server is ready.
+func mcpInitSession(t *testing.T, address string) string { //nolint:unparam // every suite drives the same endpoint; the address stays explicit at the call site
+	t.Helper()
+	var sessionID string
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		resp, err := mcpCall(address, "initialize", 0, map[string]any{
+			"protocolVersion": "2025-03-26",
+			"capabilities":    map[string]any{},
+			"clientInfo":      map[string]any{"name": "TestClient", "version": "1.0"},
+		})
+		require.NoError(ct, err)
+		require.Equal(ct, http.StatusOK, resp.StatusCode)
+		sessionID = resp.Header.Get("Mcp-Session-Id")
+		require.NotEmpty(ct, sessionID, "server must return Mcp-Session-Id header")
+		resp.Body.Close()
+	}, testTimeout, 100*time.Millisecond)
+
+	// Complete the initialization handshake.
+	require.NoError(t, mcpNotify(address, "notifications/initialized", nil,
+		"Mcp-Session-Id", sessionID))
+
+	return sessionID
+}
+
+func testPythonMCPServer(t *testing.T) {
+	const (
+		comm    = "main"
+		address = "http://localhost:8381/mcp"
+	)
+
+	// Establish a real MCP session via the SDK initialization handshake.
+	sessionID := mcpInitSession(t, address)
+
+	var tq jaeger.TracesQuery
+	params := neturl.Values{}
+	params.Add("service", comm)
+	fullJaegerURL := fmt.Sprintf("%s?%s", jaegerQueryURL, params.Encode())
+
+	// Test 1: tools/call with a known tool — verify MCP span attributes.
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		resp, err := mcpCall(address, "tools/call", 1, map[string]any{"name": "get-weather"},
+			"Mcp-Session-Id", sessionID)
+		require.NoError(ct, err)
+		require.Equal(ct, http.StatusOK, resp.StatusCode)
+
+		resp, err = getJaeger(fullJaegerURL) //nolint:noctx
+		require.NoError(ct, err)
+		if resp == nil {
+			return
+		}
+		require.Equal(ct, http.StatusOK, resp.StatusCode)
+
+		require.NoError(ct, json.NewDecoder(resp.Body).Decode(&tq))
+
+		// Find traces with MCP method attribute
+		traces := tq.FindBySpan(jaeger.Tag{Key: "mcp.method.name", Type: "string", Value: "tools/call"})
+		require.GreaterOrEqual(ct, len(traces), 1)
+
+		lastTrace := traces[len(traces)-1]
+		// The trace may contain child spans ("in queue", "processing");
+		// locate the MCP server span by its expected operation name.
+		res := lastTrace.FindByOperationName("tools/call get-weather", "server")
+		require.GreaterOrEqual(ct, len(res), 1)
+		span := res[0]
+
+		sd := span.Diff(
+			jaeger.Tag{Key: "mcp.method.name", Type: "string", Value: "tools/call"},
+			jaeger.Tag{Key: "gen_ai.operation.name", Type: "string", Value: "execute_tool"},
+			jaeger.Tag{Key: "gen_ai.tool.name", Type: "string", Value: "get-weather"},
+			jaeger.Tag{Key: "jsonrpc.request.id", Type: "string", Value: "1"},
+		)
+		assert.Empty(ct, sd, sd.String())
+
+		// Session ID is dynamically assigned; verify it is present.
+		sd = span.DiffAsRegexp(
+			jaeger.Tag{Key: "mcp.session.id", Type: "string", Value: ".+"},
+		)
+		assert.Empty(ct, sd, sd.String())
+	}, testTimeout, 100*time.Millisecond)
+
+	// Test 2: tools/call with an unknown tool — verify the span is still
+	// created with correct request-side MCP attributes.  The real MCP SDK
+	// returns errors via SSE (text/event-stream), so OBI's eBPF layer
+	// cannot extract the JSON-RPC error from the streamed response body;
+	// response-side attributes like otel.status_code are therefore not
+	// asserted here.
+	var tqErr jaeger.TracesQuery
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		resp, err := mcpCall(address, "tools/call", 2, map[string]any{"name": "nonexistent"},
+			"Mcp-Session-Id", sessionID)
+		require.NoError(ct, err)
+		require.Equal(ct, http.StatusOK, resp.StatusCode)
+
+		resp, err = getJaeger(fullJaegerURL) //nolint:noctx
+		require.NoError(ct, err)
+		if resp == nil {
+			return
+		}
+		require.Equal(ct, http.StatusOK, resp.StatusCode)
+
+		require.NoError(ct, json.NewDecoder(resp.Body).Decode(&tqErr))
+
+		// Find traces with the error tool call
+		traces := tqErr.FindBySpan(
+			jaeger.Tag{Key: "mcp.method.name", Type: "string", Value: "tools/call"},
+			jaeger.Tag{Key: "gen_ai.tool.name", Type: "string", Value: "nonexistent"},
+		)
+		require.GreaterOrEqual(ct, len(traces), 1)
+
+		lastTrace := traces[len(traces)-1]
+		res := lastTrace.FindByOperationName("tools/call nonexistent", "server")
+		require.GreaterOrEqual(ct, len(res), 1)
+		span := res[0]
+
+		sd := span.Diff(
+			jaeger.Tag{Key: "mcp.method.name", Type: "string", Value: "tools/call"},
+			jaeger.Tag{Key: "gen_ai.operation.name", Type: "string", Value: "execute_tool"},
+			jaeger.Tag{Key: "gen_ai.tool.name", Type: "string", Value: "nonexistent"},
+			jaeger.Tag{Key: "jsonrpc.request.id", Type: "string", Value: "2"},
+		)
+		assert.Empty(ct, sd, sd.String())
+	}, testTimeout, 100*time.Millisecond)
+}
+
+func testPythonMCPInitialize(t *testing.T) {
+	const (
+		comm    = "main"
+		address = "http://localhost:8381/mcp"
+	)
+
+	var tq jaeger.TracesQuery
+	params := neturl.Values{}
+	params.Add("service", comm)
+	fullJaegerURL := fmt.Sprintf("%s?%s", jaegerQueryURL, params.Encode())
+
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		resp, err := mcpCall(address, "initialize", 10, map[string]any{
+			"protocolVersion": "2025-03-26",
+			"capabilities":    map[string]any{},
+			"clientInfo":      map[string]any{"name": "TestClient", "version": "1.0"},
+		})
+		require.NoError(ct, err)
+		require.Equal(ct, http.StatusOK, resp.StatusCode)
+
+		resp, err = getJaeger(fullJaegerURL) //nolint:noctx
+		require.NoError(ct, err)
+		if resp == nil {
+			return
+		}
+		require.Equal(ct, http.StatusOK, resp.StatusCode)
+
+		require.NoError(ct, json.NewDecoder(resp.Body).Decode(&tq))
+
+		traces := tq.FindBySpan(jaeger.Tag{Key: "mcp.method.name", Type: "string", Value: "initialize"})
+		require.GreaterOrEqual(ct, len(traces), 1)
+
+		lastTrace := traces[len(traces)-1]
+		res := lastTrace.FindByOperationName("initialize", "server")
+		require.GreaterOrEqual(ct, len(res), 1)
+		span := res[0]
+
+		sd := span.Diff(
+			jaeger.Tag{Key: "mcp.method.name", Type: "string", Value: "initialize"},
+			jaeger.Tag{Key: "mcp.protocol.version", Type: "string", Value: "2025-03-26"},
+			jaeger.Tag{Key: "jsonrpc.request.id", Type: "string", Value: "10"},
+		)
+		assert.Empty(ct, sd, sd.String())
+
+		_, found := jaeger.FindIn(span.Tags, "gen_ai.operation.name")
+		assert.False(ct, found, "gen_ai.operation.name is set for tool calls only")
+	}, testTimeout, 100*time.Millisecond)
+}
+
+// testPythonMCPClient drives the instrumented server to call a second MCP
+// server, so OBI observes the outbound side of an MCP exchange. The tests above
+// only ever produce server-kind spans; this is what exercises the client-kind
+// MCP span and the peer attributes that come with it.
+func testPythonMCPClient(t *testing.T) {
+	const (
+		comm    = "main"
+		address = "http://localhost:8381/mcp"
+	)
+
+	sessionID := mcpInitSession(t, address)
+
+	var tq jaeger.TracesQuery
+	params := neturl.Values{}
+	params.Add("service", comm)
+	// The outbound call the tool makes, named after the tool it invokes on the
+	// remote server. Scoping the query to it keeps the server-side traces the
+	// retry loop generates from filling the result page.
+	params.Add("operation", "tools/call get-weather")
+	fullJaegerURL := fmt.Sprintf("%s?%s", jaegerQueryURL, params.Encode())
+
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		resp, err := mcpCall(address, "tools/call", 10,
+			map[string]any{"name": "remote-weather", "arguments": map[string]any{}},
+			"Mcp-Session-Id", sessionID)
+		require.NoError(ct, err)
+		require.Equal(ct, http.StatusOK, resp.StatusCode)
+		resp.Body.Close()
+
+		resp, err = getJaeger(fullJaegerURL) //nolint:noctx
+		require.NoError(ct, err)
+		if resp == nil {
+			return
+		}
+		require.Equal(ct, http.StatusOK, resp.StatusCode)
+		require.NoError(ct, json.NewDecoder(resp.Body).Decode(&tq))
+
+		// The remote-weather tool calls get-weather on the remote server, so the
+		// outbound tools/call is the client-kind span we are after.
+		var clientSpans []jaeger.Span
+		for _, trace := range tq.Data {
+			clientSpans = append(clientSpans,
+				trace.FindByOperationNameServiceAndKind("tools/call get-weather", comm, "client")...)
+		}
+		require.NotEmpty(ct, clientSpans, "no client-kind MCP span found")
+
+		span := clientSpans[0]
+		sd := span.Diff(
+			jaeger.Tag{Key: "mcp.method.name", Type: "string", Value: "tools/call"},
+			jaeger.Tag{Key: "gen_ai.operation.name", Type: "string", Value: "execute_tool"},
+			jaeger.Tag{Key: "gen_ai.tool.name", Type: "string", Value: "get-weather"},
+			jaeger.Tag{Key: "span.kind", Type: "string", Value: "client"},
+		)
+		assert.Empty(ct, sd, sd.String())
+
+		// The peer is the remote MCP server, not this process.
+		peer, ok := jaeger.FindIn(span.Tags, "server.address")
+		assert.True(ct, ok, "client span must name the remote server")
+		assert.NotEmpty(ct, peer.Value)
+	}, testTimeout, 500*time.Millisecond)
+}
+
+// testPythonMCPClientResource covers the resource side of the client exchange:
+// reading a resource from the remote server is what carries mcp.resource.uri.
+func testPythonMCPClientResource(t *testing.T) {
+	const (
+		comm    = "main"
+		address = "http://localhost:8381/mcp"
+	)
+
+	sessionID := mcpInitSession(t, address)
+
+	var tq jaeger.TracesQuery
+	params := neturl.Values{}
+	params.Add("service", comm)
+	params.Add("operation", "resources/read")
+	fullJaegerURL := fmt.Sprintf("%s?%s", jaegerQueryURL, params.Encode())
+
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		resp, err := mcpCall(address, "tools/call", 20,
+			map[string]any{"name": "remote-report", "arguments": map[string]any{}},
+			"Mcp-Session-Id", sessionID)
+		require.NoError(ct, err)
+		require.Equal(ct, http.StatusOK, resp.StatusCode)
+		resp.Body.Close()
+
+		resp, err = getJaeger(fullJaegerURL) //nolint:noctx
+		require.NoError(ct, err)
+		if resp == nil {
+			return
+		}
+		require.Equal(ct, http.StatusOK, resp.StatusCode)
+		require.NoError(ct, json.NewDecoder(resp.Body).Decode(&tq))
+
+		var clientSpans []jaeger.Span
+		for _, trace := range tq.Data {
+			clientSpans = append(clientSpans,
+				trace.FindByOperationNameServiceAndKind("resources/read", comm, "client")...)
+		}
+		require.NotEmpty(ct, clientSpans, "no client-kind resource read span found")
+
+		span := clientSpans[0]
+		sd := span.Diff(
+			jaeger.Tag{Key: "mcp.method.name", Type: "string", Value: "resources/read"},
+			jaeger.Tag{
+				Key: "mcp.resource.uri", Type: "string",
+				Value: "file:///home/user/documents/report.pdf",
+			},
+			jaeger.Tag{Key: "span.kind", Type: "string", Value: "client"},
+		)
+		assert.Empty(ct, sd, sd.String())
+	}, testTimeout, 500*time.Millisecond)
+}
+
+// testPythonMCPMetrics covers what the span tests above cannot: that an MCP
+// exchange reaches the semconv MCP duration histograms rather than the generic
+// HTTP ones it would otherwise fall through to.
+func testPythonMCPMetrics(t *testing.T) {
+	const address = "http://localhost:8381/mcp"
+
+	sessionID := mcpInitSession(t, address)
+
+	// The remote-weather tool calls get-weather on a second MCP server, so one
+	// request produces both a server-side and a client-side MCP operation.
+	for range 4 {
+		resp, err := mcpCall(address, "tools/call", 30,
+			map[string]any{"name": "remote-weather", "arguments": map[string]any{}},
+			"Mcp-Session-Id", sessionID)
+		require.NoError(t, err)
+		resp.Body.Close()
+	}
+
+	pq := promtest.Client{HostPort: prometheusHostPort}
+	for _, tc := range []struct {
+		name  string
+		query string
+	}{
+		{"server side", `mcp_server_operation_duration_seconds_count{` +
+			`mcp_method_name="tools/call",` +
+			`service_namespace="integration-test"}`},
+		{"client side", `mcp_client_operation_duration_seconds_count{` +
+			`mcp_method_name="tools/call",` +
+			`gen_ai_tool_name="get-weather",` +
+			`service_namespace="integration-test"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.EventuallyWithT(t, func(ct *assert.CollectT) {
+				results, err := pq.Query(tc.query)
+				require.NoError(ct, err)
+				enoughPromResults(ct, results)
+				assert.LessOrEqual(ct, 1, totalPromCount(ct, results))
+			}, testTimeout, 100*time.Millisecond)
+		})
+	}
+}
+
+// testPythonMCPSessionMetrics verifies that the MCP session-duration histograms
+// are emitted once a session has been idle for the configured TTL. The same
+// remote-weather calls exercise both the inbound server session and the outbound
+// client session. Both export paths are checked: the OTLP route through the
+// collector and obi's direct Prometheus exporter, whose series carry no resource
+// and must take their service identity from the session snapshot.
+func testPythonMCPSessionMetrics(t *testing.T) {
+	const address = "http://localhost:8381/mcp"
+
+	sessionID := mcpInitSession(t, address)
+
+	for range 2 {
+		resp, err := mcpCall(address, "tools/call", 40,
+			map[string]any{"name": "remote-weather", "arguments": map[string]any{}},
+			"Mcp-Session-Id", sessionID)
+		require.NoError(t, err)
+		resp.Body.Close()
+	}
+
+	// Wait for the configured TTL so the sessions above become idle and the
+	// background expiration closes them.
+	time.Sleep(6 * time.Second)
+
+	pq := promtest.Client{HostPort: prometheusHostPort}
+	for _, tc := range []struct {
+		name  string
+		query string
+	}{
+		{"server side", `mcp_server_session_duration_seconds_count{` +
+			`exported="otel",` +
+			`mcp_protocol_version="2025-03-26",` +
+			`service_namespace="integration-test"}`},
+		// The outbound client session negotiates the remote server's default
+		// protocol version (currently 2025-11-25), which differs from the
+		// version the test explicitly requests on the inbound side.
+		{"client side", `mcp_client_session_duration_seconds_count{` +
+			`exported="otel",` +
+			`service_namespace="integration-test"}`},
+		{"server side direct prometheus", `mcp_server_session_duration_seconds_count{` +
+			`exported="prometheus",` +
+			`mcp_protocol_version="2025-03-26",` +
+			`service_name="main",` +
+			`service_namespace="integration-test"}`},
+		{"client side direct prometheus", `mcp_client_session_duration_seconds_count{` +
+			`exported="prometheus",` +
+			`service_name="main",` +
+			`service_namespace="integration-test"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.EventuallyWithT(t, func(ct *assert.CollectT) {
+				results, err := pq.Query(tc.query)
+				require.NoError(ct, err)
+				enoughPromResults(ct, results)
+				assert.LessOrEqual(ct, 1, totalPromCount(ct, results))
+			}, testTimeout, 100*time.Millisecond)
+		})
+	}
+
+	// The direct exporter derives the job label from the service attributes
+	// retained in the session snapshot.
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		results, err := pq.Query(`mcp_server_session_duration_seconds_count{` +
+			`exported="prometheus",service_name="main"}`)
+		require.NoError(ct, err)
+		enoughPromResults(ct, results)
+		for _, res := range results {
+			assert.Equal(ct, "integration-test/main", res.Metric["job"])
+		}
+	}, testTimeout, 100*time.Millisecond)
+}

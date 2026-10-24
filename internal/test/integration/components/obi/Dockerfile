@@ -1,0 +1,35 @@
+# Development version of the beyla Dockerfile that compiles for coverage
+# and allows retrieving coverage files.
+# The production-ready minimal image is in the project root's dockerfile.
+FROM golang:1.27.0@sha256:0ecdc2a9f6156af6451080bfe3d8382a662fcc4e209608c6f919e643453514c1 AS builder
+
+ARG TARGETARCH
+
+ENV GOARCH=$TARGETARCH
+
+WORKDIR /src
+
+# Download modules before copying sources, so source changes reuse the cached
+# module layer instead of re-downloading everything
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy the go manifests and source
+COPY .git/ .git/
+COPY bpf/ bpf/
+COPY cmd/ cmd/
+COPY internal/goabi/ internal/goabi/
+COPY internal/goversion/ internal/goversion/
+COPY internal/config/ internal/config/
+COPY pkg/ pkg/
+COPY Makefile Makefile
+
+# Build
+RUN make compile-for-coverage
+
+# Create final image from minimal + built binary
+FROM ubuntu@sha256:d1e2e92c075e5ca139d51a140fff46f84315c0fdce203eab2807c7e495eff4f9
+
+COPY --from=builder /src/bin/obi /obi
+
+ENTRYPOINT [ "/obi" ]

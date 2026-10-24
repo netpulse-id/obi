@@ -1,0 +1,1862 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package prom
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"regexp"
+	"sync"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"go.opentelemetry.io/otel/trace"
+
+	"go.opentelemetry.io/obi/pkg/appolly/app"
+	"go.opentelemetry.io/obi/pkg/appolly/app/request"
+	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
+	"go.opentelemetry.io/obi/pkg/appolly/discover/exec"
+	"go.opentelemetry.io/obi/pkg/appolly/services"
+	ebpfcommon "go.opentelemetry.io/obi/pkg/ebpf/common"
+	"go.opentelemetry.io/obi/pkg/export"
+	"go.opentelemetry.io/obi/pkg/export/attributes"
+	attr "go.opentelemetry.io/obi/pkg/export/attributes/names"
+	"go.opentelemetry.io/obi/pkg/export/connector"
+	"go.opentelemetry.io/obi/pkg/export/instrumentations"
+	"go.opentelemetry.io/obi/pkg/export/otel"
+	"go.opentelemetry.io/obi/pkg/export/otel/perapp"
+	"go.opentelemetry.io/obi/pkg/internal/testutil"
+	"go.opentelemetry.io/obi/pkg/metadata"
+	"go.opentelemetry.io/obi/pkg/pipe/global"
+	"go.opentelemetry.io/obi/pkg/pipe/msg"
+	"go.opentelemetry.io/obi/pkg/pipe/swarm"
+)
+
+const timeout = 5 * time.Second
+
+// application_red keeps the RED histograms while dropping the four Opt-In body size
+// histograms, which is the whole point of splitting them into their own feature.
+func TestAppMetrics_BodySizeFeature(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		features export.Features
+		emitted  bool
+	}{
+		{name: "application bundle", features: export.FeatureApplicationRED | export.FeatureApplicationSizes, emitted: true},
+		{name: "application_red only", features: export.FeatureApplicationRED, emitted: false},
+		{name: "all features", features: export.FeatureAll, emitted: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			registry, promURL := newPrometheusTestServer(t)
+
+			promInput := msg.NewQueue[[]request.Span](msg.ChannelBufferLen(10))
+			processEvents := msg.NewQueue[exec.ProcessEvent](msg.ChannelBufferLen(20))
+			exporter, err := PrometheusEndpoint(
+				&global.ContextInfo{Prometheus: registry.Manager},
+				&PrometheusConfig{
+					Port:                        registry.Port,
+					Path:                        "/metrics",
+					TTL:                         3 * time.Minute,
+					SpanMetricsServiceCacheSize: 10,
+					Instrumentations:            []instrumentations.Instrumentation{instrumentations.InstrumentationALL},
+				},
+				&perapp.GlobalMetricsConfig{Features: tc.features},
+				&attributes.SelectorConfig{SelectionCfg: attributes.Selection{}},
+				request.UnresolvedNames{},
+				promInput,
+				processEvents,
+				nil,
+			)(ctx)
+			require.NoError(t, err)
+
+			go exporter(ctx)
+
+			svcAttrs := svc.Attrs{Features: tc.features, UID: svc.UID{Instance: "foo"}}
+			promInput.Send([]request.Span{
+				{Service: svcAttrs, Type: request.EventTypeHTTP, Path: "/foo", End: 1 * time.Second.Nanoseconds()},
+				{Service: svcAttrs, Type: request.EventTypeHTTPClient, Path: "/bar", End: 1 * time.Second.Nanoseconds()},
+			})
+
+			require.EventuallyWithT(t, func(ct *assert.CollectT) {
+				exported := getMetrics(ct, promURL)
+				assert.Contains(ct, exported, "http_server_request_duration_seconds_count")
+				assert.Contains(ct, exported, "http_client_request_duration_seconds_count")
+
+				for _, name := range []string{
+					"http_server_request_body_size_bytes",
+					"http_server_response_body_size_bytes",
+					"http_client_request_body_size_bytes",
+					"http_client_response_body_size_bytes",
+				} {
+					if tc.emitted {
+						assert.Contains(ct, exported, name)
+						continue
+					}
+					assert.NotContains(ct, exported, name)
+				}
+			}, timeout, 100*time.Millisecond)
+		})
+	}
+}
+
+func TestAppMetrics_HTTPErrorType(t *testing.T) {
+	features := export.FeatureApplicationRED | export.FeatureApplicationSizes
+	ctx := t.Context()
+	registry, promURL := newPrometheusTestServer(t)
+
+	promInput := msg.NewQueue[[]request.Span](msg.ChannelBufferLen(10))
+	processEvents := msg.NewQueue[exec.ProcessEvent](msg.ChannelBufferLen(20))
+	exporter, err := PrometheusEndpoint(
+		&global.ContextInfo{Prometheus: registry.Manager},
+		&PrometheusConfig{
+			Port:                        registry.Port,
+			Path:                        "/metrics",
+			TTL:                         3 * time.Minute,
+			SpanMetricsServiceCacheSize: 10,
+			Instrumentations:            []instrumentations.Instrumentation{instrumentations.InstrumentationHTTP},
+		},
+		&perapp.GlobalMetricsConfig{Features: features},
+		&attributes.SelectorConfig{},
+		request.UnresolvedNames{},
+		promInput,
+		processEvents,
+		nil,
+	)(ctx)
+	require.NoError(t, err)
+
+	go exporter(ctx)
+
+	svcAttrs := svc.Attrs{Features: features, UID: svc.UID{Instance: "foo"}}
+	end := 1 * time.Second.Nanoseconds()
+	promInput.Send([]request.Span{
+		{Service: svcAttrs, Type: request.EventTypeHTTP, Status: 500, End: end},
+		{Service: svcAttrs, Type: request.EventTypeHTTP, Status: 404, End: end},
+		{Service: svcAttrs, Type: request.EventTypeHTTP, SubType: request.HTTPSubtypeJSONRPC, Status: 200, End: end, JSONRPC: &request.JSONRPC{Method: "missing", Version: "2.0", ErrorCode: -32601}},
+		{Service: svcAttrs, Type: request.EventTypeHTTPClient, Status: 404, End: end},
+		{Service: svcAttrs, Type: request.EventTypeHTTPClient, Status: 200, End: end},
+	})
+
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		exported := getMetrics(ct, promURL)
+		for _, name := range []string{
+			"http_server_request_duration_seconds_count",
+			"http_server_request_body_size_bytes_count",
+			"http_server_response_body_size_bytes_count",
+		} {
+			assert.Regexp(ct, name+`\{error_type="500",[^}]*http_response_status_code="500"[^}]*\} 1`, exported)
+			assert.Regexp(ct, name+`\{error_type="",[^}]*http_response_status_code="404"[^}]*\} 1`, exported)
+			assert.Regexp(ct, name+`\{error_type="",[^}]*http_response_status_code="200"[^}]*\} 1`, exported)
+		}
+		for _, name := range []string{
+			"http_client_request_duration_seconds_count",
+			"http_client_request_body_size_bytes_count",
+			"http_client_response_body_size_bytes_count",
+		} {
+			assert.Regexp(ct, name+`\{error_type="404",[^}]*http_response_status_code="404"[^}]*\} 1`, exported)
+			assert.Regexp(ct, name+`\{error_type="",[^}]*http_response_status_code="200"[^}]*\} 1`, exported)
+		}
+		assert.NotContains(ct, exported, `error_type="-32601"`)
+	}, timeout, 100*time.Millisecond)
+}
+
+func TestAppMetrics_REDHistogramBucketBoundaries(t *testing.T) {
+	features := export.FeatureApplicationRED | export.FeatureApplicationSizes
+	// non-default and distinct per field, so a histogram that ignores cfg.Buckets or uses
+	// another field's buckets fails the bounds assertion
+	buckets := export.Buckets{
+		DurationHistogram:     []float64{0.002, 0.2, 2},
+		RequestSizeHistogram:  []float64{3, 300, 3000},
+		ResponseSizeHistogram: []float64{7, 700, 7000},
+	}
+	ctx := t.Context()
+	registry, _ := newPrometheusTestServer(t)
+
+	promInput := msg.NewQueue[[]request.Span](msg.ChannelBufferLen(10))
+	processEvents := msg.NewQueue[exec.ProcessEvent](msg.ChannelBufferLen(20))
+	exporter, err := PrometheusEndpoint(
+		&global.ContextInfo{Prometheus: registry.Manager},
+		&PrometheusConfig{
+			Port:                        registry.Port,
+			Path:                        "/metrics",
+			TTL:                         3 * time.Minute,
+			SpanMetricsServiceCacheSize: 10,
+			Instrumentations:            []instrumentations.Instrumentation{instrumentations.InstrumentationHTTP},
+			Buckets:                     buckets,
+		},
+		&perapp.GlobalMetricsConfig{Features: features},
+		&attributes.SelectorConfig{},
+		request.UnresolvedNames{},
+		promInput,
+		processEvents,
+		nil,
+	)(ctx)
+	require.NoError(t, err)
+
+	go exporter(ctx)
+
+	svcAttrs := svc.Attrs{Features: features, UID: svc.UID{Instance: "foo"}}
+	end := 1 * time.Second.Nanoseconds()
+	promInput.Send([]request.Span{
+		{Service: svcAttrs, Type: request.EventTypeHTTP, Status: 200, End: end},
+		{Service: svcAttrs, Type: request.EventTypeHTTPClient, Status: 200, End: end},
+	})
+
+	expected := map[string][]float64{
+		"http_server_request_duration_seconds": buckets.DurationHistogram,
+		"http_client_request_duration_seconds": buckets.DurationHistogram,
+		"http_server_request_body_size_bytes":  buckets.RequestSizeHistogram,
+		"http_client_request_body_size_bytes":  buckets.RequestSizeHistogram,
+		"http_server_response_body_size_bytes": buckets.ResponseSizeHistogram,
+		"http_client_response_body_size_bytes": buckets.ResponseSizeHistogram,
+	}
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		for name, want := range expected {
+			assert.Equal(ct, want, gatheredHistogramBounds(ct, registry, name), name)
+		}
+	}, timeout, 100*time.Millisecond)
+}
+
+func TestAppMetrics_GenAIHistogramBucketBoundaries(t *testing.T) {
+	// non-default and distinct per field, so a histogram that ignores cfg.Buckets or uses
+	// another field's buckets fails the bounds assertion
+	buckets := export.Buckets{
+		GenAIClientDurationHistogram: []float64{0.004, 0.4, 4},
+		GenAITokenUsageHistogram:     []float64{5, 500, 5000},
+	}
+	ctx := t.Context()
+	registry, _ := newPrometheusTestServer(t)
+
+	promInput := msg.NewQueue[[]request.Span](msg.ChannelBufferLen(10))
+	processEvents := msg.NewQueue[exec.ProcessEvent](msg.ChannelBufferLen(20))
+	exporter, err := PrometheusEndpoint(
+		&global.ContextInfo{Prometheus: registry.Manager},
+		&PrometheusConfig{
+			Port:                        registry.Port,
+			Path:                        "/metrics",
+			TTL:                         3 * time.Minute,
+			SpanMetricsServiceCacheSize: 10,
+			Instrumentations:            []instrumentations.Instrumentation{instrumentations.InstrumentationGenAI},
+			Buckets:                     buckets,
+		},
+		&perapp.GlobalMetricsConfig{Features: export.FeatureApplicationRED},
+		&attributes.SelectorConfig{},
+		request.UnresolvedNames{},
+		promInput,
+		processEvents,
+		nil,
+	)(ctx)
+	require.NoError(t, err)
+
+	go exporter(ctx)
+
+	var usage request.OpenAIUsage
+	require.NoError(t, json.Unmarshal([]byte(`{"prompt_tokens":10,"completion_tokens":20}`), &usage))
+	promInput.Send([]request.Span{{
+		Service:      svc.Attrs{Features: export.FeatureApplicationRED, UID: svc.UID{Instance: "genai"}},
+		Type:         request.EventTypeHTTPClient,
+		SubType:      request.HTTPSubtypeOpenAI,
+		RequestStart: 100,
+		End:          200,
+		GenAI:        &request.GenAI{OpenAI: &request.VendorOpenAI{Usage: usage}},
+	}})
+
+	expected := map[string][]float64{
+		"gen_ai_client_operation_duration_seconds": buckets.GenAIClientDurationHistogram,
+		"gen_ai_client_token_usage":                buckets.GenAITokenUsageHistogram,
+	}
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		for name, want := range expected {
+			assert.Equal(ct, want, gatheredHistogramBounds(ct, registry, name), name)
+		}
+	}, timeout, 100*time.Millisecond)
+}
+
+func TestAppMetricsExpiration(t *testing.T) {
+	now := syncedClock{now: time.Now()}
+	timeNow = now.Now
+
+	ctx := t.Context()
+	registry, promURL := newPrometheusTestServer(t)
+
+	var g attributes.AttrGroups
+	g.Add(attributes.GroupKubernetes)
+
+	// GIVEN a Prometheus Metrics Exporter with a metrics expire time of 3 minutes
+	promInput := msg.NewQueue[[]request.Span](msg.ChannelBufferLen(10))
+	processEvents := msg.NewQueue[exec.ProcessEvent](msg.ChannelBufferLen(20))
+	exporter, err := PrometheusEndpoint(
+		&global.ContextInfo{
+			Prometheus: registry.Manager,
+			NodeMeta: metadata.NodeMeta{
+				HostID: "my-host",
+				Metadata: []metadata.Entry{
+					{Key: "cloud.account.id", Value: "0123456789"},
+					{Key: "cloud.region", Value: "us-east-1"},
+				},
+			},
+			MetricAttributeGroups: g,
+		},
+		&PrometheusConfig{
+			Port:                        registry.Port,
+			Path:                        "/metrics",
+			TTL:                         3 * time.Minute,
+			SpanMetricsServiceCacheSize: 10,
+			Instrumentations:            []instrumentations.Instrumentation{instrumentations.InstrumentationALL},
+		},
+		&perapp.GlobalMetricsConfig{Features: export.FeatureApplicationRED | export.FeatureApplicationSizes},
+		&attributes.SelectorConfig{
+			SelectionCfg: attributes.Selection{
+				attributes.HTTPServerDuration.Section: attributes.InclusionLists{
+					Include: []string{"url_path", "k8s.app.version"},
+				},
+				attributes.Resource.Section: attributes.InclusionLists{
+					Exclude: []string{"cloud.account.id", "k8s.pod.name"},
+				},
+			},
+			ExtraGroupAttributesCfg: map[string][]attr.Name{
+				"k8s_app_meta": {"k8s.app.version"},
+			},
+		},
+		request.UnresolvedNames{},
+		promInput,
+		processEvents,
+		nil,
+	)(ctx)
+	require.NoError(t, err)
+
+	go exporter(ctx)
+
+	svcAttrs := svc.Attrs{
+		Features: export.FeatureApplicationRED | export.FeatureApplicationSizes,
+		UID:      svc.UID{Name: "test-app", Namespace: "default", Instance: "test-app-1"},
+	}
+	svcAttrs001 := svc.Attrs{
+		Features: svcAttrs.Features,
+		UID:      svcAttrs.UID,
+		Metadata: map[attr.Name]string{
+			"k8s.app.version": "v0.0.1",
+		},
+	}
+
+	app := exec.New(exec.Init{
+		Service: svcAttrs,
+		Pid:     1,
+	})
+
+	// Send a process event so we make target_info
+	processEvents.Send(exec.ProcessEvent{Type: exec.ProcessEventCreated, File: app})
+
+	// WHEN it receives metrics
+	promInput.Send([]request.Span{
+		{
+			Type:    request.EventTypeHTTP,
+			Path:    "/foo",
+			End:     123 * time.Second.Nanoseconds(),
+			Service: svcAttrs001,
+		},
+		{Service: svcAttrs, Type: request.EventTypeHTTP, Path: "/baz", End: 456 * time.Second.Nanoseconds()},
+	})
+
+	containsTargetInfo := regexp.MustCompile(`\ntarget_info\{.*host_id="my-host"`)
+	containsTargetInfoCloudRegion := regexp.MustCompile(`\ntarget_info\{.*cloud_region="us-east-1"`)
+	containsTargetInfoCloudAccount := regexp.MustCompile(`\ntarget_info\{[^\n]*cloud_account_id=`)
+	containsTargetInfoK8sPod := regexp.MustCompile(`\ntarget_info\{[^\n]*k8s_pod_name=`)
+	containsTargetInfoSDKVersion := regexp.MustCompile(`\ntarget_info\{.*telemetry_sdk_version=.*`)
+	containsJob := regexp.MustCompile(`http_server_response_body_size_bytes_count\{.*job="default/test-app".*`)
+	containsInstance := regexp.MustCompile(`http_server_response_body_size_bytes_count\{.*instance="test-app-1".*"`)
+
+	// THEN the metrics are exported
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		exported := getMetrics(ct, promURL)
+		assert.Contains(ct, exported, `http_server_request_duration_seconds_sum{k8s_app_version="v0.0.1",url_path="/foo"} 123`)
+		assert.Contains(ct, exported, `http_server_request_duration_seconds_sum{k8s_app_version="",url_path="/baz"} 456`)
+		assert.Regexp(ct, containsTargetInfo, exported)
+		assert.Regexp(ct, containsTargetInfoCloudRegion, exported)
+		assert.NotRegexp(ct, containsTargetInfoCloudAccount, exported)
+		assert.NotRegexp(ct, containsTargetInfoK8sPod, exported)
+		assert.Regexp(ct, containsTargetInfoSDKVersion, exported)
+		assert.Regexp(ct, containsJob, exported)
+		assert.Regexp(ct, containsInstance, exported)
+	}, timeout, 100*time.Millisecond)
+
+	// AND WHEN /foo keeps being received while /baz goes silent.
+	// Refresh /foo within its TTL so its entry is never expirable at the instant it is
+	// refreshed; the counter then accumulates to 246 deterministically. A single jump past
+	// the TTL would race the scrape-driven expiry, which could delete /foo and recreate it
+	// from zero (246 vs 123).
+	now.Advance(2 * time.Minute)
+	promInput.Send([]request.Span{
+		{
+			Type:    request.EventTypeHTTP,
+			Path:    "/foo",
+			End:     123 * time.Second.Nanoseconds(),
+			Service: svcAttrs001,
+		},
+	})
+
+	// THEN /foo shows the value accumulated from both observations, and /baz is still
+	// within its TTL
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		exported := getMetrics(ct, promURL)
+		assert.Contains(ct, exported, `http_server_request_duration_seconds_sum{k8s_app_version="v0.0.1",url_path="/foo"} 246`)
+		assert.Contains(ct, exported, `http_server_request_duration_seconds_sum{k8s_app_version="",url_path="/baz"} 456`)
+		assert.Regexp(ct, containsTargetInfo, exported)
+	}, timeout, 100*time.Millisecond)
+
+	// AND WHEN further time passes so /baz crosses its TTL while /foo, refreshed 2 minutes
+	// ago, stays within its own
+	now.Advance(2 * time.Minute)
+
+	// THEN /foo is still visible but /baz has expired
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		exported := getMetrics(ct, promURL)
+		assert.Contains(ct, exported, `http_server_request_duration_seconds_sum{k8s_app_version="v0.0.1",url_path="/foo"} 246`)
+		assert.NotContains(ct, exported, `http_server_request_duration_seconds_sum{k8s_app_version="",url_path="/baz"}`)
+		assert.Regexp(ct, containsTargetInfo, exported)
+	}, timeout, 100*time.Millisecond)
+
+	// AND WHEN the metrics labels that disappeared are received again
+	now.Advance(4 * time.Minute)
+	promInput.Send([]request.Span{
+		{Service: svcAttrs, Type: request.EventTypeHTTP, Path: "/baz", End: 456 * time.Second.Nanoseconds()},
+	})
+
+	// THEN they are reported again, starting from zero in the case of counters
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		exported := getMetrics(ct, promURL)
+		assert.Contains(ct, exported, `http_server_request_duration_seconds_sum{k8s_app_version="",url_path="/baz"} 456`)
+		assert.NotContains(ct, exported, `http_server_request_duration_seconds_sum{k8s_app_version="v0.0.1",url_path="/foo"}`)
+		assert.Regexp(ct, containsTargetInfo, exported)
+	}, timeout, 100*time.Millisecond)
+
+	// AND WHEN the observed process is terminated
+	processEvents.Send(exec.ProcessEvent{
+		Type: exec.ProcessEventTerminated,
+		File: app,
+	})
+
+	// THEN traces_target_info are removed
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		exported := getMetrics(ct, promURL)
+		assert.NotRegexp(ct, containsTargetInfo, exported)
+	}, timeout, 100*time.Millisecond)
+}
+
+type InstrTest struct {
+	name       string
+	instr      []instrumentations.Instrumentation
+	expected   []string
+	unexpected []string
+}
+
+func TestAppMetrics_ByInstrumentation(t *testing.T) {
+	tests := []InstrTest{
+		{
+			name:  "all instrumentations",
+			instr: []instrumentations.Instrumentation{instrumentations.InstrumentationALL},
+			expected: []string{
+				"http_server_request_duration_seconds",
+				"http_client_request_duration_seconds",
+				"rpc_server_call_duration_seconds",
+				"rpc_client_call_duration_seconds",
+				"db_client_operation_duration_seconds",
+				"db_server_operation_duration_seconds",
+				"messaging_client_operation_duration_seconds",
+				"messaging_process_duration_seconds",
+				"gpu_cuda_kernel_launch_calls_total",
+				"gpu_cuda_graph_launch_calls_total",
+				"gpu_cuda_memory_allocations_bytes_total",
+				// the _count series of each histogram: the bare names are prefixes of
+				// the pre-rename _total names, so they would match either way
+				"gpu_cuda_kernel_grid_size_count",
+				"gpu_cuda_kernel_block_size_count",
+				"gpu_cuda_memory_copies_bytes_count",
+			},
+			unexpected: []string{
+				"gpu_cuda_kernel_grid_size_total",
+				"gpu_cuda_kernel_block_size_total",
+				"gpu_cuda_memory_copies_bytes_total",
+			},
+		},
+		{
+			name:  "http only",
+			instr: []instrumentations.Instrumentation{instrumentations.InstrumentationHTTP},
+			expected: []string{
+				"http_server_request_duration_seconds",
+				"http_client_request_duration_seconds",
+			},
+			unexpected: []string{
+				"rpc_server_call_duration_seconds",
+				"rpc_client_call_duration_seconds",
+				"db_client_operation_duration_seconds",
+				"db_server_operation_duration_seconds",
+				"messaging_client_operation_duration_seconds",
+				"messaging_process_duration_seconds",
+				"gpu_cuda_kernel_launch_calls_total",
+				"gpu_cuda_graph_launch_calls_total",
+			},
+		},
+		{
+			name:  "grpc only",
+			instr: []instrumentations.Instrumentation{instrumentations.InstrumentationGRPC},
+			expected: []string{
+				"rpc_server_call_duration_seconds",
+				"rpc_client_call_duration_seconds",
+			},
+			unexpected: []string{
+				"http_server_request_duration_seconds",
+				"http_client_request_duration_seconds",
+				"db_client_operation_duration_seconds",
+				"db_server_operation_duration_seconds",
+				"messaging_client_operation_duration_seconds",
+				"messaging_process_duration_seconds",
+			},
+		},
+		{
+			name:  "redis only",
+			instr: []instrumentations.Instrumentation{instrumentations.InstrumentationRedis},
+			expected: []string{
+				"db_client_operation_duration_seconds",
+				"db_server_operation_duration_seconds",
+				`db_system_name="redis"`,
+			},
+			unexpected: []string{
+				"http_server_request_duration_seconds",
+				"http_client_request_duration_seconds",
+				"rpc_server_call_duration_seconds",
+				"rpc_client_call_duration_seconds",
+				"messaging_client_operation_duration_seconds",
+				"messaging_process_duration_seconds",
+			},
+		},
+		{
+			name:  "memcached only",
+			instr: []instrumentations.Instrumentation{instrumentations.InstrumentationMemcached},
+			expected: []string{
+				"db_client_operation_duration_seconds",
+				"db_server_operation_duration_seconds",
+			},
+			unexpected: []string{
+				"http_server_request_duration_seconds",
+				"http_client_request_duration_seconds",
+				"rpc_server_call_duration_seconds",
+				"rpc_client_call_duration_seconds",
+				"messaging_client_operation_duration_seconds",
+				"messaging_process_duration_seconds",
+			},
+		},
+		{
+			name:  "sql only",
+			instr: []instrumentations.Instrumentation{instrumentations.InstrumentationSQL},
+			expected: []string{
+				"db_client_operation_duration_seconds",
+				"db_server_operation_duration_seconds",
+			},
+			unexpected: []string{
+				"http_server_request_duration_seconds",
+				"http_client_request_duration_seconds",
+				"rpc_server_call_duration_seconds",
+				"rpc_client_call_duration_seconds",
+				"messaging_client_operation_duration_seconds",
+				"messaging_process_duration_seconds",
+			},
+		},
+		{
+			name:  "kafka only",
+			instr: []instrumentations.Instrumentation{instrumentations.InstrumentationKafka},
+			expected: []string{
+				"messaging_client_operation_duration_seconds",
+				"messaging_process_duration_seconds",
+			},
+			unexpected: []string{
+				"http_server_request_duration_seconds",
+				"http_client_request_duration_seconds",
+				"rpc_server_call_duration_seconds",
+				"rpc_client_call_duration_seconds",
+				"db_client_operation_duration_seconds",
+				"db_server_operation_duration_seconds",
+			},
+		},
+		{
+			name:  "mqtt only",
+			instr: []instrumentations.Instrumentation{instrumentations.InstrumentationMQTT},
+			expected: []string{
+				"messaging_client_operation_duration_seconds",
+				"messaging_process_duration_seconds",
+			},
+			unexpected: []string{
+				"http_server_request_duration_seconds",
+				"http_client_request_duration_seconds",
+				"rpc_server_call_duration_seconds",
+				"rpc_client_call_duration_seconds",
+				"db_client_operation_duration_seconds",
+				"db_server_operation_duration_seconds",
+			},
+		},
+		{
+			name:  "nats only",
+			instr: []instrumentations.Instrumentation{instrumentations.InstrumentationNATS},
+			expected: []string{
+				"messaging_client_operation_duration_seconds",
+				"messaging_process_duration_seconds",
+			},
+			unexpected: []string{
+				"http_server_request_duration_seconds",
+				"http_client_request_duration_seconds",
+				"rpc_server_call_duration_seconds",
+				"rpc_client_call_duration_seconds",
+				"db_client_operation_duration_seconds",
+				"db_server_operation_duration_seconds",
+			},
+		},
+		{
+			name:  "amqp only",
+			instr: []instrumentations.Instrumentation{instrumentations.InstrumentationAMQP},
+			expected: []string{
+				"messaging_client_operation_duration_seconds",
+				"messaging_process_duration_seconds",
+			},
+			unexpected: []string{
+				"http_server_request_duration_seconds",
+				"http_client_request_duration_seconds",
+				"rpc_server_call_duration_seconds",
+				"rpc_client_call_duration_seconds",
+				"db_client_operation_duration_seconds",
+				"db_server_operation_duration_seconds",
+			},
+		},
+		{
+			name:  "sunrpc only",
+			instr: []instrumentations.Instrumentation{instrumentations.InstrumentationSunRPC},
+			expected: []string{
+				"rpc_server_call_duration_seconds",
+				"rpc_client_call_duration_seconds",
+			},
+			unexpected: []string{
+				"http_server_request_duration_seconds",
+				"http_client_request_duration_seconds",
+				"messaging_client_operation_duration_seconds",
+				"db_client_operation_duration_seconds",
+				"db_server_operation_duration_seconds",
+			},
+		},
+		{
+			name:  "aerospike only",
+			instr: []instrumentations.Instrumentation{instrumentations.InstrumentationAerospike},
+			expected: []string{
+				"db_client_operation_duration_seconds",
+				"aerospike_get",
+			},
+			unexpected: []string{
+				`db_operation_name="SELECT"`,
+				`db_operation_name="SET"`,
+				`db_operation_name="GET"`,
+				`db_operation_name="find"`,
+				"db_server_operation_duration_seconds",
+			},
+		},
+
+		{
+			name:     "none",
+			instr:    nil,
+			expected: []string{},
+			unexpected: []string{
+				"http_server_request_duration_seconds",
+				"http_client_request_duration_seconds",
+				"rpc_server_call_duration_seconds",
+				"rpc_client_call_duration_seconds",
+				"db_client_operation_duration_seconds",
+				"db_server_operation_duration_seconds",
+				"messaging_client_operation_duration_seconds",
+				"messaging_process_duration_seconds",
+			},
+		},
+		{
+			name:  "sql and redis",
+			instr: []instrumentations.Instrumentation{instrumentations.InstrumentationSQL, instrumentations.InstrumentationRedis},
+			expected: []string{
+				"db_client_operation_duration_seconds",
+				"db_server_operation_duration_seconds",
+			},
+			unexpected: []string{
+				"http_server_request_duration_seconds",
+				"http_client_request_duration_seconds",
+				"rpc_server_call_duration_seconds",
+				"rpc_client_call_duration_seconds",
+				"messaging_client_operation_duration_seconds",
+				"messaging_process_duration_seconds",
+				"aerospike_get",
+			},
+		},
+		{
+			name:  "kafka and grpc",
+			instr: []instrumentations.Instrumentation{instrumentations.InstrumentationGRPC, instrumentations.InstrumentationKafka},
+			expected: []string{
+				"rpc_server_call_duration_seconds",
+				"rpc_client_call_duration_seconds",
+				"messaging_client_operation_duration_seconds",
+				"messaging_process_duration_seconds",
+			},
+			unexpected: []string{
+				"http_server_request_duration_seconds",
+				"http_client_request_duration_seconds",
+				"db_client_operation_duration_seconds",
+			},
+		},
+		{
+			name:  "mongo",
+			instr: []instrumentations.Instrumentation{instrumentations.InstrumentationMongo},
+			expected: []string{
+				"db_client_operation_duration_seconds",
+			},
+			unexpected: []string{
+				"http_server_request_duration_seconds",
+				"http_client_request_duration_seconds",
+				"rpc_server_call_duration_seconds",
+				"rpc_client_call_duration_seconds",
+				"messaging_client_operation_duration_seconds",
+				"messaging_process_duration_seconds",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			now := syncedClock{now: time.Now()}
+			timeNow = now.Now
+
+			ctx := t.Context()
+			registry, promURL := newPrometheusTestServer(t)
+
+			promInput := msg.NewQueue[[]request.Span](msg.ChannelBufferLen(10))
+			exporter := makePromExporter(ctx, t, tt.instr, registry, promInput)
+			go exporter(ctx)
+
+			promInput.Send([]request.Span{
+				{Service: svc.Attrs{Features: export.FeatureApplicationRED, UID: svc.UID{Instance: "foo"}}, Type: request.EventTypeAerospikeClient, Method: "aerospike_get", RequestStart: 150, End: 175},
+				{Service: svc.Attrs{Features: export.FeatureApplicationRED, UID: svc.UID{Instance: "foo"}}, Type: request.EventTypeHTTP, Path: "/foo", RequestStart: 100, End: 200},
+				{Service: svc.Attrs{Features: export.FeatureApplicationRED, UID: svc.UID{Instance: "foo"}}, Type: request.EventTypeHTTPClient, Path: "/bar", RequestStart: 150, End: 175},
+				{Service: svc.Attrs{Features: export.FeatureApplicationRED, UID: svc.UID{Instance: "foo"}}, Type: request.EventTypeGRPC, Path: "/foo", RequestStart: 100, End: 200},
+				{Service: svc.Attrs{Features: export.FeatureApplicationRED, UID: svc.UID{Instance: "foo"}}, Type: request.EventTypeGRPCClient, Path: "/bar", RequestStart: 150, End: 175},
+				{Service: svc.Attrs{Features: export.FeatureApplicationRED, UID: svc.UID{Instance: "foo"}}, Type: request.EventTypeSQLClient, Method: "SELECT", RequestStart: 150, End: 175},
+				{Service: svc.Attrs{Features: export.FeatureApplicationRED, UID: svc.UID{Instance: "foo"}}, Type: request.EventTypeSQLServer, Method: "SELECT", RequestStart: 150, End: 175},
+				{Service: svc.Attrs{Features: export.FeatureApplicationRED, UID: svc.UID{Instance: "foo"}}, Type: request.EventTypeRedisClient, Method: "SET", RequestStart: 150, End: 175},
+				{Service: svc.Attrs{Features: export.FeatureApplicationRED, UID: svc.UID{Instance: "foo"}}, Type: request.EventTypeRedisServer, Method: "GET", RequestStart: 150, End: 175},
+				{Service: svc.Attrs{Features: export.FeatureApplicationRED, UID: svc.UID{Instance: "foo"}}, Type: request.EventTypeMemcachedClient, Method: "SET", RequestStart: 150, End: 175},
+				{Service: svc.Attrs{Features: export.FeatureApplicationRED, UID: svc.UID{Instance: "foo"}}, Type: request.EventTypeMemcachedServer, Method: "GET", RequestStart: 150, End: 175},
+				{Service: svc.Attrs{Features: export.FeatureApplicationRED, UID: svc.UID{Instance: "foo"}}, Type: request.EventTypeKafkaClient, Method: request.MessagingSend, RequestStart: 150, End: 175},
+				{Service: svc.Attrs{Features: export.FeatureApplicationRED, UID: svc.UID{Instance: "foo"}}, Type: request.EventTypeKafkaServer, Method: "process", RequestStart: 150, End: 175},
+				{Service: svc.Attrs{Features: export.FeatureApplicationRED, UID: svc.UID{Instance: "foo"}}, Type: request.EventTypeMQTTClient, Method: "publish", RequestStart: 150, End: 175},
+				{Service: svc.Attrs{Features: export.FeatureApplicationRED, UID: svc.UID{Instance: "foo"}}, Type: request.EventTypeMQTTServer, Method: "process", RequestStart: 150, End: 175},
+				{Service: svc.Attrs{Features: export.FeatureApplicationRED, UID: svc.UID{Instance: "foo"}}, Type: request.EventTypeNATSClient, Method: "publish", RequestStart: 150, End: 175},
+				{Service: svc.Attrs{Features: export.FeatureApplicationRED, UID: svc.UID{Instance: "foo"}}, Type: request.EventTypeNATSServer, Method: "process", RequestStart: 150, End: 175},
+				{Service: svc.Attrs{Features: export.FeatureApplicationRED, UID: svc.UID{Instance: "foo"}}, Type: request.EventTypeAMQPClient, Method: "publish", RequestStart: 150, End: 175},
+				{Service: svc.Attrs{Features: export.FeatureApplicationRED, UID: svc.UID{Instance: "foo"}}, Type: request.EventTypeAMQPClient, Method: "process", RequestStart: 150, End: 175},
+				{Service: svc.Attrs{Features: export.FeatureApplicationRED, UID: svc.UID{Instance: "foo"}}, Type: request.EventTypeSunRPCClient, Path: "portmapper", Route: "0", SubType: 2, HostPort: 111, RequestStart: 150, End: 175},
+				{Service: svc.Attrs{Features: export.FeatureApplicationRED, UID: svc.UID{Instance: "foo"}}, Type: request.EventTypeSunRPCServer, Path: "portmapper", Route: "0", SubType: 2, HostPort: 111, RequestStart: 150, End: 175},
+				{Service: svc.Attrs{Features: export.FeatureApplicationRED, UID: svc.UID{Instance: "foo"}}, Type: request.EventTypeMongoClient, Method: "find", RequestStart: 150, End: 175},
+				{Service: svc.Attrs{Features: export.FeatureApplicationRED, UID: svc.UID{Instance: "foo"}}, Type: request.EventTypeGPUCudaKernelLaunch, ContentLength: 100, SubType: 200},
+				{Service: svc.Attrs{Features: export.FeatureApplicationRED, UID: svc.UID{Instance: "foo"}}, Type: request.EventTypeGPUCudaMemcpy, ContentLength: 100, SubType: 1},
+				{Service: svc.Attrs{Features: export.FeatureApplicationRED, UID: svc.UID{Instance: "foo"}}, Type: request.EventTypeGPUCudaMalloc, ContentLength: 100},
+				{Service: svc.Attrs{Features: export.FeatureApplicationRED, UID: svc.UID{Instance: "foo"}}, Type: request.EventTypeGPUCudaGraphLaunch},
+			})
+			awaitSpanProcessing()
+
+			var exported string
+			require.EventuallyWithT(t, func(ct *assert.CollectT) {
+				exported = getMetrics(ct, promURL)
+				for i := 0; i < len(tt.expected); i++ {
+					assert.Contains(ct, exported, tt.expected[i])
+				}
+				for i := 0; i < len(tt.unexpected); i++ {
+					assert.NotContains(ct, exported, tt.unexpected[i])
+				}
+			}, timeout, 100*time.Millisecond)
+		})
+	}
+}
+
+func TestMetricsDiscarded(t *testing.T) {
+	mr := metricsReporter{
+		cfg: &PrometheusConfig{},
+	}
+
+	svcNoExport := svc.Attrs{Features: export.FeatureApplicationRED}
+
+	svcExportMetrics := svc.Attrs{Features: export.FeatureApplicationRED}
+	svcExportMetrics.SetExportsOTelMetrics()
+
+	svcExportTraces := svc.Attrs{Features: export.FeatureApplicationRED}
+	svcExportTraces.SetExportsOTelTraces()
+
+	svcExportMetricsSpan := svc.Attrs{Features: export.FeatureApplicationRED}
+	svcExportMetricsSpan.SetExportsOTelMetricsSpan()
+
+	tests := []struct {
+		name      string
+		span      request.Span
+		discarded bool
+	}{
+		{
+			name:      "Foo span is not filtered",
+			span:      request.Span{Service: svcNoExport, Type: request.EventTypeHTTPClient, Method: "GET", Route: "/foo", RequestStart: 100, End: 200},
+			discarded: false,
+		},
+		{
+			name:      "/v1/metrics span is filtered",
+			span:      request.Span{Service: svcExportMetrics, Type: request.EventTypeHTTPClient, Method: "GET", Route: "/v1/metrics", RequestStart: 100, End: 200},
+			discarded: true,
+		},
+		{
+			name:      "/v1/traces span is not filtered",
+			span:      request.Span{Service: svcExportTraces, Type: request.EventTypeHTTPClient, Method: "GET", Route: "/v1/traces", RequestStart: 100, End: 200},
+			discarded: false,
+		},
+		{
+			name:      "/v1/traces span is not filtered",
+			span:      request.Span{Service: svcExportMetricsSpan, Type: request.EventTypeHTTPClient, Method: "GET", Route: "/v1/traces", RequestStart: 100, End: 200},
+			discarded: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.discarded, !mr.otelMetricsObserved(&tt.span), tt.name)
+			assert.False(t, mr.otelSpanFiltered(&tt.span), tt.name)
+		})
+	}
+}
+
+func TestSpanMetricsDiscarded(t *testing.T) {
+	mr := metricsReporter{
+		cfg: &PrometheusConfig{},
+	}
+
+	svcNoExport := svc.Attrs{Features: export.FeatureSpanOTel}
+
+	svcExportMetrics := svc.Attrs{Features: export.FeatureSpanOTel}
+	svcExportMetrics.SetExportsOTelMetrics()
+
+	svcExportMetricsSpan := svc.Attrs{Features: export.FeatureSpanOTel}
+	svcExportMetricsSpan.SetExportsOTelMetricsSpan()
+
+	tests := []struct {
+		name      string
+		span      request.Span
+		discarded bool
+	}{
+		{
+			name:      "Foo span is not filtered",
+			span:      request.Span{Service: svcNoExport, Type: request.EventTypeHTTPClient, Method: "GET", Route: "/foo", RequestStart: 100, End: 200},
+			discarded: false,
+		},
+		{
+			name:      "/v1/metrics span is filtered",
+			span:      request.Span{Service: svcExportMetrics, Type: request.EventTypeHTTPClient, Method: "GET", Route: "/v1/metrics", RequestStart: 100, End: 200},
+			discarded: false,
+		},
+		{
+			name:      "/v1/traces span is not filtered",
+			span:      request.Span{Service: svcExportMetricsSpan, Type: request.EventTypeHTTPClient, Method: "GET", Route: "/v1/traces", RequestStart: 100, End: 200},
+			discarded: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.discarded, !mr.otelSpanMetricsObserved(&tt.span), tt.name)
+			assert.False(t, mr.otelSpanFiltered(&tt.span), tt.name)
+		})
+	}
+}
+
+func TestSpanMetricsDiscardedGraph(t *testing.T) {
+	mr := metricsReporter{
+		cfg: &PrometheusConfig{},
+	}
+
+	svcNoExport := svc.Attrs{Features: export.FeatureSpanLegacy}
+
+	svcExportMetrics := svc.Attrs{Features: export.FeatureSpanLegacy}
+	svcExportMetrics.SetExportsOTelMetrics()
+
+	svcExportMetricsSpan := svc.Attrs{Features: export.FeatureSpanLegacy}
+	svcExportMetricsSpan.SetExportsOTelMetricsSpan()
+
+	tests := []struct {
+		name      string
+		span      request.Span
+		discarded bool
+	}{
+		{
+			name:      "Foo span is not filtered",
+			span:      request.Span{Service: svcNoExport, Type: request.EventTypeHTTPClient, Method: "GET", Route: "/foo", RequestStart: 100, End: 200},
+			discarded: false,
+		},
+		{
+			name:      "/v1/metrics span is filtered",
+			span:      request.Span{Service: svcExportMetrics, Type: request.EventTypeHTTPClient, Method: "GET", Route: "/v1/metrics", RequestStart: 100, End: 200},
+			discarded: false,
+		},
+		{
+			name:      "/v1/traces span is not filtered",
+			span:      request.Span{Service: svcExportMetricsSpan, Type: request.EventTypeHTTPClient, Method: "GET", Route: "/v1/traces", RequestStart: 100, End: 200},
+			discarded: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.discarded, !mr.otelSpanMetricsObserved(&tt.span), tt.name)
+			assert.False(t, mr.otelSpanFiltered(&tt.span), tt.name)
+		})
+	}
+}
+
+func TestTerminatesOnBadPromPort(t *testing.T) {
+	now := syncedClock{now: time.Now()}
+	timeNow = now.Now
+
+	ctx := t.Context()
+	listener, err := net.Listen("tcp", ":0")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, listener.Close()) })
+	openPort := listener.Addr().(*net.TCPAddr).Port
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT)
+	t.Cleanup(func() { signal.Stop(sigChan) })
+
+	pm := connector.PrometheusManager{}
+
+	c := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: TracesTargetInfo,
+		Help: "target service information in trace span metric format",
+	}, []string{"a"}).MetricVec
+
+	pm.Register(openPort, "/metrics", c)
+	go pm.StartHTTP(ctx)
+
+	ok := false
+	select {
+	case sig := <-sigChan:
+		assert.Equal(t, syscall.SIGINT, sig)
+		ok = true
+	case <-time.After(timeout):
+		ok = false
+	}
+
+	assert.True(t, ok)
+}
+
+func TestProcessPIDEvents(t *testing.T) {
+	mr := metricsReporter{
+		cfg:         &PrometheusConfig{},
+		serviceMap:  map[svc.UID]svc.Attrs{},
+		pidsTracker: otel.NewPidServiceTracker(),
+	}
+
+	svcA := svc.Attrs{
+		UID: svc.UID{Name: "A", Instance: "A"},
+	}
+	svcB := svc.Attrs{
+		UID: svc.UID{Name: "B", Instance: "B"},
+	}
+
+	mr.setupPIDToServiceRelationship(1, svcA.UID)
+	mr.setupPIDToServiceRelationship(2, svcA.UID)
+	mr.setupPIDToServiceRelationship(3, svcB.UID)
+	mr.setupPIDToServiceRelationship(4, svcB.UID)
+
+	deleted, uid := mr.disassociatePIDFromService(1)
+	assert.False(t, deleted)
+	assert.Equal(t, svc.UID{}, uid)
+
+	deleted, uid = mr.disassociatePIDFromService(1)
+	assert.False(t, deleted)
+	assert.Equal(t, svc.UID{}, uid)
+
+	deleted, uid = mr.disassociatePIDFromService(2)
+	assert.True(t, deleted)
+	assert.Equal(t, svcA.UID, uid)
+
+	deleted, uid = mr.disassociatePIDFromService(3)
+	assert.False(t, deleted)
+	assert.Equal(t, svc.UID{}, uid)
+
+	deleted, uid = mr.disassociatePIDFromService(4)
+	assert.True(t, deleted)
+	assert.Equal(t, svcB.UID, uid)
+}
+
+func TestExemplarFilter(t *testing.T) {
+	sampledSpan := &request.Span{
+		TraceID:    trace.TraceID{0x1},
+		TraceFlags: ebpfcommon.TPFlagSampled,
+	}
+	unsampledSpan := &request.Span{
+		TraceID:    trace.TraceID{0x2},
+		TraceFlags: 0x00,
+	}
+	noTraceSpan := &request.Span{}
+
+	testCases := []struct {
+		name                  string
+		filterConfig          string
+		expectFilterSampled   bool
+		expectFilterUnsampled bool
+	}{
+		{
+			name:                  "default trace based",
+			filterConfig:          "",
+			expectFilterSampled:   false,
+			expectFilterUnsampled: false,
+		},
+		{
+			name:                  "trace based explicit",
+			filterConfig:          "trace_based",
+			expectFilterSampled:   true,
+			expectFilterUnsampled: false,
+		},
+		{
+			name:                  "always on",
+			filterConfig:          "always_on",
+			expectFilterSampled:   true,
+			expectFilterUnsampled: true,
+		},
+		{
+			name:                  "always off",
+			filterConfig:          "always_off",
+			expectFilterSampled:   false,
+			expectFilterUnsampled: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			filter := exemplarFilter(tc.filterConfig)
+			assert.Equal(t, tc.expectFilterSampled, filter(sampledSpan))
+			assert.Equal(t, tc.expectFilterUnsampled, filter(unsampledSpan))
+			assert.False(t, filter(noTraceSpan))
+		})
+	}
+}
+
+func TestObserveHistogramAddsExemplarWhenEnabled(t *testing.T) {
+	histogram := prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "test_histogram",
+		Help:    "test",
+		Buckets: []float64{1, 2, 4},
+	})
+	reporter := metricsReporter{
+		shouldAddExemplar: exemplarFilter("always_on"),
+	}
+	span := &request.Span{
+		TraceID: trace.TraceID{0x1},
+		SpanID:  trace.SpanID{0x2},
+	}
+
+	reporter.observeHistogram(histogram, 1.5, span)
+
+	var metric dto.Metric
+	require.NoError(t, histogram.Write(&metric))
+	require.NotNil(t, metric.Histogram)
+	require.Len(t, metric.Histogram.Bucket, 3)
+	require.NotNil(t, metric.Histogram.Bucket[1].Exemplar)
+	assert.InEpsilon(t, 1.5, *metric.Histogram.Bucket[1].Exemplar.Value, 1e-10)
+	assert.Equal(t, span.TraceID.String(), exemplarLabelValue(metric.Histogram.Bucket[1].Exemplar, "traceID"))
+	assert.Equal(t, span.SpanID.String(), exemplarLabelValue(metric.Histogram.Bucket[1].Exemplar, "spanID"))
+}
+
+func TestAddCounterSkipsExemplarWhenFiltered(t *testing.T) {
+	counter := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "test_counter",
+		Help: "test",
+	})
+	reporter := metricsReporter{
+		shouldAddExemplar: exemplarFilter("trace_based"),
+	}
+	span := &request.Span{
+		TraceID:    trace.TraceID{0x1},
+		TraceFlags: 0x00,
+	}
+
+	reporter.addCounter(counter, 2, span)
+
+	var metric dto.Metric
+	require.NoError(t, counter.Write(&metric))
+	require.NotNil(t, metric.Counter)
+	assert.InEpsilon(t, 2, *metric.Counter.Value, 1e-10)
+	assert.Nil(t, metric.Counter.Exemplar)
+}
+
+func exemplarLabelValue(exemplar *dto.Exemplar, name string) string {
+	for _, label := range exemplar.Label {
+		if label.GetName() == name {
+			return label.GetValue()
+		}
+	}
+
+	return ""
+}
+
+var mmux = sync.Mutex{}
+
+func newPrometheusTestServer(t *testing.T) (*testutil.PrometheusServer, string) {
+	t.Helper()
+	server := testutil.NewPrometheusServer(t)
+	return server, server.URL
+}
+
+func getMetrics(t require.TestingT, promURL string) string {
+	mmux.Lock()
+	defer mmux.Unlock()
+	resp, err := http.Get(promURL)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	return string(body)
+}
+
+// awaitSpanProcessing allows for slower CI environments to catch up. The
+// intention is to prevent race conditions between sending spans, processing
+// them, and advancing the mocked clock.
+func awaitSpanProcessing() {
+	time.Sleep(10 * time.Millisecond)
+}
+
+type syncedClock struct {
+	mt  sync.Mutex
+	now time.Time
+}
+
+func (c *syncedClock) Now() time.Time {
+	c.mt.Lock()
+	defer c.mt.Unlock()
+	return c.now
+}
+
+func (c *syncedClock) Advance(t time.Duration) {
+	c.mt.Lock()
+	defer c.mt.Unlock()
+	c.now = c.now.Add(t)
+}
+
+func makePromExporter(
+	ctx context.Context, t *testing.T, instrumentations []instrumentations.Instrumentation,
+	registry *testutil.PrometheusServer,
+	input *msg.Queue[[]request.Span],
+) swarm.RunFunc {
+	processEvents := msg.NewQueue[exec.ProcessEvent](msg.ChannelBufferLen(20))
+	exporter, err := PrometheusEndpoint(
+		&global.ContextInfo{Prometheus: registry.Manager},
+		&PrometheusConfig{
+			Port:                        registry.Port,
+			Path:                        "/metrics",
+			TTL:                         300 * time.Minute,
+			SpanMetricsServiceCacheSize: 10,
+			Instrumentations:            instrumentations,
+		},
+		&perapp.GlobalMetricsConfig{Features: export.FeatureApplicationRED},
+		&attributes.SelectorConfig{
+			SelectionCfg: attributes.Selection{
+				attributes.HTTPServerDuration.Section: attributes.InclusionLists{
+					Include: []string{"url_path"},
+				},
+			},
+		},
+		request.UnresolvedNames{},
+		input,
+		processEvents,
+		nil,
+	)(ctx)
+	require.NoError(t, err)
+
+	return exporter
+}
+
+func TestPrometheusGenAITokenAvailability(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		usageJSON string
+		reported  bool
+	}{
+		{name: "explicit zero", usageJSON: `{"prompt_tokens":0,"completion_tokens":0}`, reported: true},
+		{name: "missing", usageJSON: `{}`, reported: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			registry, promURL := newPrometheusTestServer(t)
+			input := msg.NewQueue[[]request.Span](msg.ChannelBufferLen(10))
+			exporter := makePromExporter(ctx, t,
+				[]instrumentations.Instrumentation{instrumentations.InstrumentationGenAI},
+				registry,
+				input,
+			)
+			go exporter(ctx)
+
+			var usage request.OpenAIUsage
+			require.NoError(t, json.Unmarshal([]byte(tc.usageJSON), &usage))
+			input.Send([]request.Span{{
+				Service:      svc.Attrs{Features: export.FeatureApplicationRED, UID: svc.UID{Instance: "genai"}},
+				Type:         request.EventTypeHTTPClient,
+				SubType:      request.HTTPSubtypeOpenAI,
+				RequestStart: 100,
+				End:          200,
+				GenAI:        &request.GenAI{OpenAI: &request.VendorOpenAI{Usage: usage}},
+			}})
+
+			inputCount := regexp.MustCompile(`\ngen_ai_client_token_usage_count\{[^\n]*gen_ai_token_type="input"[^\n]*\} 1`)
+			outputCount := regexp.MustCompile(`\ngen_ai_client_token_usage_count\{[^\n]*gen_ai_token_type="output"[^\n]*\} 1`)
+			require.EventuallyWithT(t, func(ct *assert.CollectT) {
+				exported := getMetrics(ct, promURL)
+				assert.Contains(ct, exported, "gen_ai_client_operation_duration_seconds_count")
+				if tc.reported {
+					assert.Regexp(ct, inputCount, exported)
+					assert.Regexp(ct, outputCount, exported)
+				} else {
+					assert.NotRegexp(ct, inputCount, exported)
+					assert.NotRegexp(ct, outputCount, exported)
+				}
+			}, timeout, 10*time.Millisecond)
+		})
+	}
+}
+
+func TestPrometheusMCPOperationDuration(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		eventType request.EventType
+		want      string
+		notWant   []string
+	}{
+		{"client side", request.EventTypeHTTPClient, "mcp_client_operation_duration_seconds_count", []string{
+			"http_client_request_duration_seconds_count",
+			"http_client_request_body_size_bytes_count",
+			"http_client_response_body_size_bytes_count",
+		}},
+		{"server side", request.EventTypeHTTP, "mcp_server_operation_duration_seconds_count", []string{
+			"http_server_request_duration_seconds_count",
+			"http_server_request_body_size_bytes_count",
+			"http_server_response_body_size_bytes_count",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			registry, promURL := newPrometheusTestServer(t)
+			input := msg.NewQueue[[]request.Span](msg.ChannelBufferLen(10))
+			exporter := makePromExporter(ctx, t,
+				[]instrumentations.Instrumentation{instrumentations.InstrumentationHTTP, instrumentations.InstrumentationGenAI},
+				registry,
+				input,
+			)
+			go exporter(ctx)
+
+			input.Send([]request.Span{{
+				Service:      svc.Attrs{Features: export.FeatureApplicationRED, UID: svc.UID{Instance: "mcp"}},
+				Type:         tc.eventType,
+				SubType:      request.HTTPSubtypeMCP,
+				Method:       "POST",
+				RequestStart: 100,
+				End:          200,
+				GenAI: &request.GenAI{MCP: &request.MCPCall{
+					Method:      "tools/call",
+					ToolName:    "get_weather",
+					ProtocolVer: "2025-06-18",
+				}},
+			}})
+
+			require.EventuallyWithT(t, func(ct *assert.CollectT) {
+				exported := getMetrics(ct, promURL)
+				assert.Contains(ct, exported, tc.want)
+				assert.Contains(ct, exported, `mcp_method_name="tools/call"`)
+				assert.Contains(ct, exported, `gen_ai_tool_name="get_weather"`)
+				// An MCP span must not also land on the plain HTTP duration or
+				// body size metrics it would otherwise fall through to.
+				for _, notWant := range tc.notWant {
+					assert.NotContains(ct, exported, notWant)
+				}
+			}, timeout, 10*time.Millisecond)
+		})
+	}
+}
+
+type mockEventMetrics struct {
+	createCalls []svc.Attrs
+	deleteCalls []svc.Attrs
+}
+
+func newMockEventMetrics() *mockEventMetrics {
+	return &mockEventMetrics{
+		createCalls: make([]svc.Attrs, 0),
+		deleteCalls: make([]svc.Attrs, 0),
+	}
+}
+
+func (m *mockEventMetrics) createEventMetrics(service *svc.Attrs) {
+	m.createCalls = append(m.createCalls, *service)
+}
+
+func (m *mockEventMetrics) deleteEventMetrics(service *svc.Attrs) {
+	m.deleteCalls = append(m.deleteCalls, *service)
+}
+
+func TestHandleProcessEventCreated(t *testing.T) {
+	tests := []struct {
+		name           string
+		setup          func(*metricsReporter, *mockEventMetrics)
+		event          exec.ProcessEvent
+		expectedCreate []svc.Attrs
+		expectedDelete []svc.Attrs
+		expectedMap    map[svc.UID]svc.Attrs
+	}{
+		{
+			name: "new service - fresh start",
+			setup: func(*metricsReporter, *mockEventMetrics) {
+				// No setup needed for fresh start
+			},
+			event: exec.ProcessEvent{
+				Type: exec.ProcessEventCreated,
+				File: exec.New(exec.Init{
+					Pid: 1234,
+					Service: svc.Attrs{
+						UID: svc.UID{
+							Name:      "test-service",
+							Namespace: "default",
+							Instance:  "instance-1",
+						},
+						HostName: "test-host",
+					},
+				}),
+			},
+			expectedCreate: []svc.Attrs{
+				{
+					UID: svc.UID{
+						Name:      "test-service",
+						Namespace: "default",
+						Instance:  "instance-1",
+					},
+					HostName: "test-host",
+				},
+			},
+			expectedDelete: nil,
+			expectedMap: map[svc.UID]svc.Attrs{
+				{
+					Name:      "test-service",
+					Namespace: "default",
+					Instance:  "instance-1",
+				}: {
+					UID: svc.UID{
+						Name:      "test-service",
+						Namespace: "default",
+						Instance:  "instance-1",
+					},
+					HostName: "test-host",
+				},
+			},
+		},
+		{
+			name: "same service UID with updated attributes",
+			setup: func(r *metricsReporter, _ *mockEventMetrics) {
+				// Pre-populate service map with existing service
+				uid := svc.UID{
+					Name:      "test-service",
+					Namespace: "default",
+					Instance:  "instance-1",
+				}
+				r.serviceMap[uid] = svc.Attrs{
+					UID:      uid,
+					HostName: "old-host",
+				}
+			},
+			event: exec.ProcessEvent{
+				Type: exec.ProcessEventCreated,
+				File: exec.New(exec.Init{
+					Pid: 1234,
+					Service: svc.Attrs{
+						UID: svc.UID{
+							Name:      "test-service",
+							Namespace: "default",
+							Instance:  "instance-1",
+						},
+						HostName: "new-host",
+					},
+				}),
+			},
+			expectedCreate: []svc.Attrs{
+				{
+					UID: svc.UID{
+						Name:      "test-service",
+						Namespace: "default",
+						Instance:  "instance-1",
+					},
+					HostName: "new-host",
+				},
+			},
+			expectedDelete: []svc.Attrs{
+				{
+					UID: svc.UID{
+						Name:      "test-service",
+						Namespace: "default",
+						Instance:  "instance-1",
+					},
+					HostName: "old-host",
+				},
+			},
+			expectedMap: map[svc.UID]svc.Attrs{
+				{
+					Name:      "test-service",
+					Namespace: "default",
+					Instance:  "instance-1",
+				}: {
+					UID: svc.UID{
+						Name:      "test-service",
+						Namespace: "default",
+						Instance:  "instance-1",
+					},
+					HostName: "new-host",
+				},
+			},
+		},
+		{
+			name: "PID changing service (stale UID with existing attributes)",
+			setup: func(r *metricsReporter, _ *mockEventMetrics) {
+				// Setup: PID 1234 is already tracked with stale UID
+				staleUID := svc.UID{
+					Name:      "old-service",
+					Namespace: "default",
+					Instance:  "instance-1",
+				}
+				r.pidsTracker.AddPID(1234, staleUID)
+
+				// Add stale service to service map
+				r.serviceMap[staleUID] = svc.Attrs{
+					UID:      staleUID,
+					HostName: "test-host",
+				}
+			},
+			event: exec.ProcessEvent{
+				Type: exec.ProcessEventCreated,
+				File: exec.New(exec.Init{
+					Pid: 1234,
+					Service: svc.Attrs{
+						UID: svc.UID{
+							Name:      "new-service",
+							Namespace: "default",
+							Instance:  "instance-1",
+						},
+						HostName: "test-host",
+					},
+				}),
+			},
+			expectedCreate: []svc.Attrs{
+				{
+					UID: svc.UID{
+						Name:      "new-service",
+						Namespace: "default",
+						Instance:  "instance-1",
+					},
+					HostName: "test-host",
+				},
+			},
+			expectedDelete: []svc.Attrs{
+				{
+					UID: svc.UID{
+						Name:      "old-service",
+						Namespace: "default",
+						Instance:  "instance-1",
+					},
+					HostName: "test-host",
+				},
+			},
+			expectedMap: map[svc.UID]svc.Attrs{
+				{
+					Name:      "new-service",
+					Namespace: "default",
+					Instance:  "instance-1",
+				}: {
+					UID: svc.UID{
+						Name:      "new-service",
+						Namespace: "default",
+						Instance:  "instance-1",
+					},
+					HostName: "test-host",
+				},
+			},
+		},
+		{
+			name: "PID changing service (stale UID without existing attributes)",
+			setup: func(r *metricsReporter, _ *mockEventMetrics) {
+				// Setup: PID 1234 is already tracked with stale UID, but no service map entry
+				staleUID := svc.UID{
+					Name:      "old-service",
+					Namespace: "default",
+					Instance:  "instance-1",
+				}
+				r.pidsTracker.AddPID(1234, staleUID)
+				// Note: deliberately NOT adding to serviceMap to test this edge case
+			},
+			event: exec.ProcessEvent{
+				Type: exec.ProcessEventCreated,
+				File: exec.New(exec.Init{
+					Pid: 1234,
+					Service: svc.Attrs{
+						UID: svc.UID{
+							Name:      "new-service",
+							Namespace: "default",
+							Instance:  "instance-1",
+						},
+						HostName: "test-host",
+					},
+				}),
+			},
+			expectedCreate: nil,
+			expectedDelete: nil,
+			expectedMap:    map[svc.UID]svc.Attrs{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockEventsStore := mockEventMetrics{}
+
+			// Create a minimal metricsReporter with mocks
+			reporter := &metricsReporter{
+				serviceMap:         make(map[svc.UID]svc.Attrs),
+				pidsTracker:        otel.NewPidServiceTracker(),
+				createEventMetrics: mockEventsStore.createEventMetrics,
+				deleteEventMetrics: mockEventsStore.deleteEventMetrics,
+			}
+
+			// Setup any initial state
+			tt.setup(reporter, &mockEventsStore)
+
+			// Create a test logger (using slog.Default for simplicity)
+			logger := slog.Default()
+
+			// Execute the function under test
+			reporter.handleProcessEvent(tt.event, logger)
+
+			// Verify create calls
+			assert.Equal(t, tt.expectedCreate, mockEventsStore.createCalls,
+				"Create event metrics calls should match expected")
+
+			// Verify delete calls
+			assert.Equal(t, tt.expectedDelete, mockEventsStore.deleteCalls,
+				"Delete event metrics calls should match expected")
+
+			// Verify service map state
+			assert.Equal(t, tt.expectedMap, reporter.serviceMap,
+				"Service map should match expected state")
+		})
+	}
+}
+
+func TestHandleProcessEventCreatedMetricsExportDisabled(t *testing.T) {
+	exportsEmpty := services.NewExportModes()
+	tracesOnly := services.NewExportModes()
+	tracesOnly.AllowTraces()
+
+	for _, tt := range []struct {
+		name        string
+		exportModes services.ExportModes
+	}{
+		{
+			name:        "exports empty",
+			exportModes: exportsEmpty,
+		},
+		{
+			name:        "traces only",
+			exportModes: tracesOnly,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			reporter := &metricsReporter{
+				serviceMap:  make(map[svc.UID]svc.Attrs),
+				pidsTracker: otel.NewPidServiceTracker(),
+			}
+			reporter.createEventMetrics = reporter.createTargetInfos
+			reporter.deleteEventMetrics = reporter.deleteTargetInfoMetrics
+
+			uid := svc.UID{Name: "metrics-disabled-service-" + tt.name, Namespace: "default", Instance: "instance-1"}
+			service := svc.Attrs{
+				ExportModes: tt.exportModes,
+				UID:         uid,
+				HostName:    "test-host",
+			}
+			event := exec.ProcessEvent{
+				Type: exec.ProcessEventCreated,
+				File: exec.New(exec.Init{
+					Pid:     1234,
+					Service: service,
+				}),
+			}
+
+			reporter.handleProcessEvent(event, slog.Default())
+
+			assert.Equal(t, map[svc.UID]svc.Attrs{uid: service}, reporter.serviceMap)
+			assert.True(t, reporter.pidsTracker.ServiceLive(uid))
+
+			reporter.handleProcessEvent(exec.ProcessEvent{
+				Type: exec.ProcessEventTerminated,
+				File: event.File,
+			}, slog.Default())
+
+			assert.Empty(t, reporter.serviceMap)
+			assert.False(t, reporter.pidsTracker.ServiceLive(uid))
+		})
+	}
+}
+
+func TestTargetInfoHelpersSkipMetricsExportDisabled(t *testing.T) {
+	exportsEmpty := services.NewExportModes()
+	tracesOnly := services.NewExportModes()
+	tracesOnly.AllowTraces()
+
+	for _, tt := range []struct {
+		name        string
+		exportModes services.ExportModes
+	}{
+		{
+			name:        "exports empty",
+			exportModes: exportsEmpty,
+		},
+		{
+			name:        "traces only",
+			exportModes: tracesOnly,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			uid := svc.UID{Name: "metrics-disabled-service-" + tt.name, Namespace: "default", Instance: "instance-1"}
+			service := svc.Attrs{
+				ExportModes: tt.exportModes,
+				UID:         uid,
+				HostName:    "test-host",
+			}
+			mockEventsStore := newMockEventMetrics()
+			reporter := &metricsReporter{
+				serviceMap:         map[svc.UID]svc.Attrs{uid: service},
+				deleteEventMetrics: mockEventsStore.deleteEventMetrics,
+			}
+
+			assert.NotPanics(t, func() {
+				reporter.createTargetInfos(&service)
+			})
+			assert.NotPanics(t, func() {
+				reporter.deleteTargetInfoMetrics(&service)
+			})
+
+			reporter.deleteTargetInfos(uid, &service)
+
+			assert.Empty(t, mockEventsStore.deleteCalls)
+		})
+	}
+}
+
+func TestHandleProcessEventCreated_EdgeCases(t *testing.T) {
+	t.Run("multiple PIDs for same service", func(t *testing.T) {
+		mockEventsStore := newMockEventMetrics()
+
+		reporter := &metricsReporter{
+			serviceMap:         make(map[svc.UID]svc.Attrs),
+			pidsTracker:        otel.NewPidServiceTracker(),
+			createEventMetrics: mockEventsStore.createEventMetrics,
+			deleteEventMetrics: mockEventsStore.deleteEventMetrics,
+		}
+
+		uid := svc.UID{Name: "multi-pid-service", Namespace: "default", Instance: "instance-1"}
+		service := svc.Attrs{UID: uid, HostName: "test-host"}
+
+		// Add first PID
+		event1 := exec.ProcessEvent{
+			Type: exec.ProcessEventCreated,
+			File: exec.New(exec.Init{Pid: 1111, Service: service}),
+		}
+		reporter.handleProcessEvent(event1, slog.Default())
+
+		// Add second PID for same service
+		event2 := exec.ProcessEvent{
+			Type: exec.ProcessEventCreated,
+			File: exec.New(exec.Init{Pid: 2222, Service: service}),
+		}
+		reporter.handleProcessEvent(event2, slog.Default())
+
+		// Service should only be created once initially, then updated once for the same UID
+		assert.Len(t, mockEventsStore.createCalls, 2) // One for each PID event
+		assert.Len(t, mockEventsStore.deleteCalls, 1) // One delete when second event updates existing service
+	})
+
+	t.Run("concurrent service updates", func(t *testing.T) {
+		mockEventsStore := newMockEventMetrics()
+
+		reporter := &metricsReporter{
+			serviceMap:         make(map[svc.UID]svc.Attrs),
+			pidsTracker:        otel.NewPidServiceTracker(),
+			createEventMetrics: mockEventsStore.createEventMetrics,
+			deleteEventMetrics: mockEventsStore.deleteEventMetrics,
+		}
+
+		uid := svc.UID{Name: "concurrent-service", Namespace: "default", Instance: "instance-1"}
+
+		// Simulate rapid updates to same service with different metadata
+		for i := range 5 {
+			service := svc.Attrs{
+				UID:      uid,
+				HostName: fmt.Sprintf("host-%d", i),
+			}
+
+			event := exec.ProcessEvent{
+				Type: exec.ProcessEventCreated,
+				File: exec.New(exec.Init{Pid: app.PID(1000 + i), Service: service}),
+			}
+			reporter.handleProcessEvent(event, slog.Default())
+		}
+
+		// Should end up with latest service attributes
+		finalService := reporter.serviceMap[uid]
+		assert.Equal(t, "host-4", finalService.HostName)
+
+		// Should have created 5 times and deleted 4 times (each update after first deletes previous)
+		assert.Len(t, mockEventsStore.createCalls, 5)
+		assert.Len(t, mockEventsStore.deleteCalls, 4)
+	})
+}
+
+// A span with no measured duration stays out of the RED series, whose buckets are only
+// meaningful next to a duration. otelSpanFiltered still passes it, so the service graph
+// can count the call.
+func TestREDMetricsWithholdDurationsFromUnmeasuredSpans(t *testing.T) {
+	mr := metricsReporter{cfg: &PrometheusConfig{}}
+
+	svcRED := svc.Attrs{Features: export.FeatureApplicationRED}
+
+	unmeasured := request.Span{
+		Service: svcRED, Type: request.EventTypeHTTPClient, Method: "GET", Route: "/r",
+		RequestStart: 100, End: 6_000_000_000, ResponseObservation: request.ResponseReceived,
+	}
+	request.SetIgnoreDurations(&unmeasured)
+
+	// The control differs only in having been observed.
+	measured := request.Span{
+		Service: svcRED, Type: request.EventTypeHTTPClient, Method: "GET", Route: "/r",
+		RequestStart: 100, End: 200, Status: 200,
+	}
+
+	assert.True(t, mr.otelMetricsObserved(&measured),
+		"an observed call is in the RED series")
+	assert.True(t, mr.otelMetricsObserved(&unmeasured),
+		"a call with no measured duration is still in the RED family: the request it sent "+
+			"has a known size even though its duration says more than the request")
+	assert.False(t, mr.otelSpanFiltered(&unmeasured),
+		"it is withheld from durations, not filtered out of every metric")
+}
+
+// A call whose response was never observed still sent a request, and the size of that
+// request is known. Withholding the duration must not withhold what the request itself
+// carried. The response size stays out: an unmeasured record carries a zeroed response
+// length, and publishing it would report an empty response for a call whose response was
+// never seen.
+func TestREDMetricsUnmeasuredSpanPublishesRequestSizeOnly(t *testing.T) {
+	ctx := t.Context()
+	registry, promURL := newPrometheusTestServer(t)
+
+	promInput := msg.NewQueue[[]request.Span](msg.ChannelBufferLen(10))
+	processEvents := msg.NewQueue[exec.ProcessEvent](msg.ChannelBufferLen(20))
+	exporter, err := PrometheusEndpoint(
+		&global.ContextInfo{Prometheus: registry.Manager},
+		&PrometheusConfig{
+			Port:                        registry.Port,
+			Path:                        "/metrics",
+			TTL:                         3 * time.Minute,
+			SpanMetricsServiceCacheSize: 10,
+			Instrumentations:            []instrumentations.Instrumentation{instrumentations.InstrumentationALL},
+		},
+		&perapp.GlobalMetricsConfig{Features: export.FeatureApplicationRED | export.FeatureApplicationSizes},
+		&attributes.SelectorConfig{SelectionCfg: attributes.Selection{}},
+		request.UnresolvedNames{},
+		promInput,
+		processEvents,
+		nil,
+	)(ctx)
+	require.NoError(t, err)
+
+	go exporter(ctx)
+
+	svcAttrs := svc.Attrs{
+		Features: export.FeatureApplicationRED | export.FeatureApplicationSizes,
+		UID:      svc.UID{Name: "test-app", Namespace: "default", Instance: "test-app-1"},
+	}
+
+	unmeasured := request.Span{
+		Service:             svcAttrs,
+		Type:                request.EventTypeHTTPClient,
+		Method:              "GET",
+		Route:               "/unmeasured",
+		RequestStart:        100,
+		End:                 6 * time.Second.Nanoseconds(),
+		ContentLength:       512,
+		ResponseObservation: request.ResponseReceived,
+	}
+	request.SetIgnoreDurations(&unmeasured)
+
+	promInput.Send([]request.Span{unmeasured})
+
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		exported := getMetrics(ct, promURL)
+		assert.Contains(ct, exported, "http_client_request_body_size_bytes_count",
+			"the size of the request that was sent is known and must be reported")
+		assert.NotContains(ct, exported, "http_client_request_duration_seconds_count",
+			"a duration that runs past the request it describes was published")
+		assert.NotContains(ct, exported, "http_client_response_body_size_bytes_count",
+			"a response nobody saw was reported as having a size")
+	}, timeout, 100*time.Millisecond)
+}
+
+// The span metric names are selected per naming mode from declarations shared with the OTLP
+// exporter. Selecting the wrong declaration renames a published series and still compiles, so
+// both modes are pinned here.
+func TestSpanMetricsNames(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		features        export.Features
+		expectedLatency string
+		expectedCalls   string
+	}{
+		{
+			name:            "otel naming",
+			features:        export.FeatureSpanOTel,
+			expectedLatency: "traces_span_metrics_duration_seconds",
+			expectedCalls:   "traces_span_metrics_calls_total",
+		},
+		{
+			name:            "legacy naming",
+			features:        export.FeatureSpanLegacy,
+			expectedLatency: "traces_spanmetrics_latency",
+			expectedCalls:   "traces_spanmetrics_calls_total",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mp := &perapp.GlobalMetricsConfig{Features: tc.features}
+			assert.Equal(t, tc.expectedLatency, spanMetricsLatencyName(mp))
+			assert.Equal(t, tc.expectedCalls, spanMetricsCallsName(mp))
+		})
+	}
+}

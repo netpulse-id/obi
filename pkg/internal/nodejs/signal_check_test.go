@@ -1,0 +1,607 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+//go:build linux
+
+package nodejs
+
+import (
+	"context"
+	"debug/elf"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
+
+	"go.opentelemetry.io/obi/pkg/appolly/app"
+	"go.opentelemetry.io/obi/pkg/export/debug"
+	"go.opentelemetry.io/obi/pkg/internal/procs"
+	"go.opentelemetry.io/obi/pkg/obi"
+)
+
+func handleFor(t *testing.T, pid int) *procs.ProcessHandle {
+	t.Helper()
+
+	p := app.PID(pid)
+
+	startTime, err := procs.StartTime(p)
+	if err != nil {
+		t.Fatalf("reading start time of %d: %v", pid, err)
+	}
+
+	handle, err := procs.OpenProcessHandle(p, startTime)
+	if err != nil {
+		t.Fatalf("opening handle for %d: %v", pid, err)
+	}
+	t.Cleanup(func() { _ = handle.Close() })
+
+	return handle
+}
+
+// exitedHandle is a live handle whose process has since exited and been reaped,
+// which is what a target disappearing mid-injection leaves behind. A handle to
+// a pid that never existed cannot be opened at all, so it cannot stand in.
+func exitedHandle(t *testing.T) *procs.ProcessHandle {
+	t.Helper()
+
+	cmd := exec.Command("sleep", "600")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start sleep: %v", err)
+	}
+
+	handle := handleFor(t, cmd.Process.Pid)
+
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatalf("failed to kill sleep: %v", err)
+	}
+	if _, err := cmd.Process.Wait(); err != nil {
+		t.Fatalf("failed to reap sleep: %v", err)
+	}
+
+	return handle
+}
+
+func findNodeBinary(t *testing.T) string {
+	t.Helper()
+	path, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not found in PATH")
+	}
+	// Resolve symlinks to get the real node binary path
+	nodePath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatalf("failed to resolve node path: %v", err)
+	}
+	return nodePath
+}
+
+// startNodeScript evaluates code with "node -e". The working directory is a
+// fresh temp dir, because the source scan falls back to it when the command
+// line names no entry point.
+func startNodeScript(t *testing.T, script string) *exec.Cmd {
+	t.Helper()
+	// Skips when node is absent, so `make test` on a host without it does not
+	// fail. Every spawn helper guards here rather than at each call site.
+	findNodeBinary(t)
+
+	cmd := exec.Command("node", "-e", script)
+	cmd.Dir = t.TempDir()
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start node: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	awaitNodeReady(t, cmd.Process.Pid)
+	return cmd
+}
+
+// startNodeApp runs a script from a file so the process has a resolvable
+// application directory, which "node -e" does not.
+func startNodeApp(t *testing.T, script string) *exec.Cmd {
+	t.Helper()
+	findNodeBinary(t)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.js")
+	if err := os.WriteFile(path, []byte(script), 0o644); err != nil {
+		t.Fatalf("failed to write script: %v", err)
+	}
+
+	cmd := exec.Command("node", "app.js")
+	cmd.Dir = dir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start node: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	awaitNodeReady(t, cmd.Process.Pid)
+	return cmd
+}
+
+// awaitNodeReady waits until the runtime has installed its own SIGUSR1
+// handler, which is the point from which these tests can read anything
+// meaningful about it. Polling rather than sleeping a fixed interval: the
+// install lands milliseconds after exec, but that is a property of the runtime
+// and not something to time.
+//
+// A runtime that never catches SIGUSR1 — built or launched to leave it alone —
+// is an environment these tests cannot assert against, the same as one with no
+// Node installed at all, so they skip rather than fail. The gates are exercised
+// without a Node runtime elsewhere in this file. The kernel's own view goes
+// into the message, because "fatal" alone does not say whether the process was
+// alive and leaving the signal at its default or already gone.
+func awaitNodeReady(t *testing.T, pid int) {
+	t.Helper()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for handleFor(t, pid).SignalDisposition(unix.SIGUSR1) != procs.SignalDispositionHandled {
+		if time.Now().After(deadline) {
+			t.Skipf("this Node does not catch SIGUSR1, so there is nothing to assert against: %s",
+				procSignalState(pid))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// awaitScriptHandler waits for a handler the script registered with
+// process.on to reach libuv's signal tree.
+//
+// This is a later and separate event from the one awaitNodeReady waits for.
+// Node's own SIGUSR1 handler is installed during bootstrap, before user code
+// runs, and shows up in SigCgt; process.on goes through uv_signal_start and
+// lands in the tree only once the script has executed. A test that reads the
+// tree has to wait for this one.
+func awaitScriptHandler(t *testing.T, pid int, elfFile *elf.File) {
+	t.Helper()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for hasUserSIGUSR1Handler(pid, elfFile, readNodeSymbols(elfFile)) != signalCheckFound {
+		if time.Now().After(deadline) {
+			t.Fatalf("the script's SIGUSR1 handler never reached libuv's signal tree")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func openNodeELF(t *testing.T, pid int) *elf.File {
+	t.Helper()
+	path := fmt.Sprintf("/proc/%d/exe", pid)
+	f, err := elf.Open(path)
+	if err != nil {
+		t.Fatalf("failed to open ELF: %v", err)
+	}
+	t.Cleanup(func() { f.Close() })
+	return f
+}
+
+func TestHasUserSIGUSR1Handler_NoHandler(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("requires root to read /proc/<pid>/mem")
+	}
+
+	cmd := startNodeScript(t, `
+		const http = require('http');
+		const s = http.createServer((req, res) => res.end('ok'));
+		s.listen(0, () => console.log('ready'));
+		setTimeout(() => {}, 600000);
+	`)
+
+	ef := openNodeELF(t, cmd.Process.Pid)
+
+	result := hasUserSIGUSR1Handler(cmd.Process.Pid, ef, readNodeSymbols(ef))
+	if result != signalCheckNotFound {
+		t.Errorf("expected signalCheckNotFound, got %d", result)
+	}
+}
+
+func TestHasUserSIGUSR1Handler_WithHandler(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("requires root to read /proc/<pid>/mem")
+	}
+
+	cmd := startNodeScript(t, `
+		process.on('SIGUSR1', () => console.log('got sigusr1'));
+		setTimeout(() => {}, 600000);
+	`)
+
+	ef := openNodeELF(t, cmd.Process.Pid)
+	awaitScriptHandler(t, cmd.Process.Pid, ef)
+
+	result := hasUserSIGUSR1Handler(cmd.Process.Pid, ef, readNodeSymbols(ef))
+	if result != signalCheckFound {
+		t.Errorf("expected signalCheckFound, got %d", result)
+	}
+}
+
+func TestHasUserSIGUSR1Handler_OtherSignalOnly(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("requires root to read /proc/<pid>/mem")
+	}
+
+	cmd := startNodeScript(t, `
+		process.on('SIGINT', () => { console.log('got sigint'); process.exit(0); });
+		setTimeout(() => {}, 600000);
+	`)
+
+	ef := openNodeELF(t, cmd.Process.Pid)
+
+	result := hasUserSIGUSR1Handler(cmd.Process.Pid, ef, readNodeSymbols(ef))
+	if result != signalCheckNotFound {
+		t.Errorf("expected signalCheckNotFound, got %d", result)
+	}
+}
+
+func TestFindExeBaseAddr(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("requires root to read /proc/<pid>/maps")
+	}
+
+	cmd := startNodeScript(t, `setTimeout(() => {}, 600000);`)
+	pid := cmd.Process.Pid
+
+	base, err := procs.FindExeBaseAddr(app.PID(pid))
+	if err != nil {
+		t.Fatalf("findExeBaseAddr failed: %v", err)
+	}
+
+	ef := openNodeELF(t, pid)
+
+	if ef.Type == elf.ET_DYN {
+		// PIE binary: base should be non-zero (ASLR puts it somewhere in memory)
+		if base == 0 {
+			t.Error("expected non-zero base address for PIE binary")
+		}
+		t.Logf("PIE binary: base address = 0x%x", base)
+	} else {
+		// Non-PIE (ET_EXEC): base should match the ELF's lowest PT_LOAD vaddr
+		// (typically 0x400000 on x86-64)
+		if base == 0 {
+			t.Error("expected non-zero base address")
+		}
+		t.Logf("non-PIE binary: base address = 0x%x", base)
+	}
+}
+
+func TestFindExeBaseAddr_InvalidPid(t *testing.T) {
+	_, err := procs.FindExeBaseAddr(99999999)
+	if err == nil {
+		t.Error("expected error for invalid pid")
+	}
+}
+
+func TestFindExeSymbols_SignalTree(t *testing.T) {
+	nodePath := findNodeBinary(t)
+	f, err := elf.Open(nodePath)
+	if err != nil {
+		t.Fatalf("failed to open node ELF: %v", err)
+	}
+	defer f.Close()
+
+	syms, err := procs.FindExeSymbols(f, []string{"uv__signal_tree"}, elf.STT_OBJECT)
+	if err != nil {
+		t.Fatalf("FindExeSymbols failed: %v", err)
+	}
+	sym, ok := syms["uv__signal_tree"]
+	if !ok {
+		t.Fatal("expected to find uv__signal_tree symbol")
+	}
+	if sym.Off == 0 {
+		t.Error("expected non-zero address for uv__signal_tree")
+	}
+}
+
+func TestFindExeSymbols_NotFound(t *testing.T) {
+	nodePath := findNodeBinary(t)
+	f, err := elf.Open(nodePath)
+	if err != nil {
+		t.Fatalf("failed to open node ELF: %v", err)
+	}
+	defer f.Close()
+
+	syms, err := procs.FindExeSymbols(f, []string{"nonexistent_symbol_xyz"}, elf.STT_OBJECT)
+	if err != nil {
+		t.Fatalf("FindExeSymbols failed: %v", err)
+	}
+	if _, ok := syms["nonexistent_symbol_xyz"]; ok {
+		t.Error("expected symbol not to be found")
+	}
+}
+
+func openELFPath(t *testing.T, path string) *elf.File {
+	t.Helper()
+	f, err := elf.Open(path)
+	if err != nil {
+		t.Fatalf("failed to open ELF %s: %v", path, err)
+	}
+	t.Cleanup(func() { f.Close() })
+	return f
+}
+
+func testBinaryELF(t *testing.T) *elf.File {
+	t.Helper()
+	path, err := os.Executable()
+	if err != nil {
+		t.Fatalf("failed to locate test binary: %v", err)
+	}
+	return openELFPath(t, path)
+}
+
+func TestReadNodeSymbols_AbsentTable(t *testing.T) {
+	if readNodeSymbols(nil).hasTree {
+		t.Error("an absent symbol table must not yield a signal tree")
+	}
+}
+
+// A build that strips .symtab names no signal tree, and the injector falls back
+// to the source scan; that path is covered elsewhere. What must hold here is
+// that when the table does name it, the address is usable rather than zero.
+func TestReadNodeSymbols_NodeBinary(t *testing.T) {
+	syms := readNodeSymbols(openELFPath(t, findNodeBinary(t)))
+	if !syms.hasTree {
+		t.Skip("this node build strips uv__signal_tree from .symtab")
+	}
+
+	if syms.signalTree.Off == 0 {
+		t.Error("a named uv__signal_tree must resolve to a non-zero offset")
+	}
+}
+
+// procSignalState reports what the kernel says about a process, so a failure
+// here does not need a second run to interpret: a zombie and a live process
+// that never installed a handler both read as fatal otherwise.
+func procSignalState(pid int) string {
+	status, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		return fmt.Sprintf("/proc/%d/status unreadable: %v", pid, err)
+	}
+
+	var fields []string
+	for line := range strings.SplitSeq(string(status), "\n") {
+		for _, prefix := range []string{"State:", "SigIgn:", "SigCgt:"} {
+			if strings.HasPrefix(line, prefix) {
+				fields = append(fields, strings.TrimSpace(line))
+			}
+		}
+	}
+
+	return strings.Join(fields, " ")
+}
+
+// The premise the disposition gate rests on: a Node runtime catches SIGUSR1,
+// so the signal cannot terminate it. The spawn helper waits for exactly that,
+// and this states it as an assertion rather than an implicit precondition.
+func TestSigusr1Disposition_NodeCatchesSignal(t *testing.T) {
+	cmd := startNodeScript(t, `setTimeout(() => {}, 600000);`)
+
+	if got := handleFor(t, cmd.Process.Pid).SignalDisposition(unix.SIGUSR1); got != procs.SignalDispositionHandled {
+		t.Errorf("expected procs.SignalDispositionHandled for a Node process, got %d (%s)",
+			got, procSignalState(cmd.Process.Pid))
+	}
+}
+
+func TestSigusr1Disposition_FatalWithoutHandler(t *testing.T) {
+	cmd := exec.Command("sleep", "600")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start sleep: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+
+	if got := handleFor(t, cmd.Process.Pid).SignalDisposition(unix.SIGUSR1); got != procs.SignalDispositionFatal {
+		t.Errorf("expected procs.SignalDispositionFatal for a process with no SIGUSR1 handler, got %d", got)
+	}
+}
+
+// The wait exists for the window after exec in which a runtime has not yet
+// installed its handler. A shell starts with SIGUSR1 fatal and takes the signal
+// over partway through the window, so one PID's disposition flips and only a
+// poll can observe it: reading once would answer fatal.
+//
+// A shell rather than a Node runtime, because the flip has to land inside the
+// window on a loaded machine and a V8 startup is not something to bet that on.
+func TestAwaitSignalDisposition_WaitsForHandlerInstall(t *testing.T) {
+	cmd := exec.Command("sh", "-c", `sleep 0.1; trap "" USR1; sleep 60`)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start the shell: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+
+	if got := handleFor(t, cmd.Process.Pid).AwaitSignalDisposition(t.Context(), unix.SIGUSR1, dispositionWait); got != procs.SignalDispositionHandled {
+		t.Errorf("expected the wait to see the signal taken over, got %d (%s)",
+			got, procSignalState(cmd.Process.Pid))
+	}
+}
+
+// A process that never installs a handler is reported fatal once the window
+// closes, rather than waited on forever.
+func TestAwaitSignalDisposition_FatalAfterWindow(t *testing.T) {
+	cmd := exec.Command("sleep", "600")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start sleep: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+
+	start := time.Now()
+	got := handleFor(t, cmd.Process.Pid).AwaitSignalDisposition(t.Context(), unix.SIGUSR1, dispositionWait)
+	if got != procs.SignalDispositionFatal {
+		t.Errorf("expected procs.SignalDispositionFatal, got %d", got)
+	}
+	if waited := time.Since(start); waited < dispositionWait {
+		t.Errorf("returned after %v, want at least the %v window", waited, dispositionWait)
+	}
+}
+
+// Shutdown concludes nothing about the target, so it must not be reported as
+// the signal being fatal to it.
+func TestAwaitSignalDisposition_CancellationIsUnknown(t *testing.T) {
+	cmd := exec.Command("sleep", "600")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start sleep: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if got := handleFor(t, cmd.Process.Pid).AwaitSignalDisposition(ctx, unix.SIGUSR1, dispositionWait); got != procs.SignalDispositionUnknown {
+		t.Errorf("expected procs.SignalDispositionUnknown on cancellation, got %d", got)
+	}
+}
+
+func TestSigusr1Disposition_UnknownForDeadProcess(t *testing.T) {
+	if got := exitedHandle(t).SignalDisposition(unix.SIGUSR1); got != procs.SignalDispositionUnknown {
+		t.Errorf("expected procs.SignalDispositionUnknown for a nonexistent pid, got %d", got)
+	}
+}
+
+func TestSignalTreeRuntimeAddr_ResolvesForNode(t *testing.T) {
+	cmd := startNodeScript(t, `setTimeout(() => {}, 600000);`)
+	nodeELF := openNodeELF(t, cmd.Process.Pid)
+	syms := readNodeSymbols(nodeELF)
+	if !syms.hasTree {
+		t.Skip("this node build names no uv__signal_tree; distribution builds strip it")
+	}
+
+	addr, ok := signalTreeRuntimeAddr(cmd.Process.Pid, nodeELF, syms)
+	if !ok {
+		t.Fatal("expected a named uv__signal_tree to resolve to a runtime address")
+	}
+	if addr == 0 {
+		t.Error("expected a non-zero runtime address")
+	}
+}
+
+func TestSIGUSR1Refusal_DispositionUnreadable(t *testing.T) {
+	reason := sigusr1Refusal(context.Background(), exitedHandle(t), openELFPath(t, findNodeBinary(t)))
+	if reason != refusalDispositionUnknown {
+		t.Errorf("expected %q, got %q", refusalDispositionUnknown, reason)
+	}
+}
+
+func TestSIGUSR1Refusal_SignalWouldBeFatal(t *testing.T) {
+	cmd := exec.Command("sleep", "600")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start sleep: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+
+	reason := sigusr1Refusal(context.Background(), handleFor(t, cmd.Process.Pid), openELFPath(t, findNodeBinary(t)))
+	if reason != refusalSignalIsFatal {
+		t.Errorf("expected %q, got %q", refusalSignalIsFatal, reason)
+	}
+}
+
+func TestSIGUSR1Refusal_CleanAppIsSignalled(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("requires root to read /proc/<pid>/mem")
+	}
+
+	cmd := startNodeApp(t, `setTimeout(() => {}, 600000);`)
+
+	if reason := sigusr1Refusal(context.Background(), handleFor(t, cmd.Process.Pid), openNodeELF(t, cmd.Process.Pid)); reason != "" {
+		t.Errorf("expected a clean Node application to be signaled, got %q", reason)
+	}
+}
+
+func TestSIGUSR1Refusal_WithHandler(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("requires root to read /proc/<pid>/mem")
+	}
+
+	cmd := startNodeScript(t, `
+		process.on('SIGUSR1', () => console.log('got sigusr1'));
+		setTimeout(() => {}, 600000);
+	`)
+	nodeELF := openNodeELF(t, cmd.Process.Pid)
+	if _, ok := signalTreeRuntimeAddr(cmd.Process.Pid, nodeELF, readNodeSymbols(nodeELF)); !ok {
+		t.Skip("this node build carries no readable libuv signal tree")
+	}
+	awaitScriptHandler(t, cmd.Process.Pid, nodeELF)
+
+	reason := sigusr1Refusal(context.Background(), handleFor(t, cmd.Process.Pid), nodeELF)
+	if reason != refusalHandlerFound {
+		t.Errorf("expected %q for a process with a custom SIGUSR1 handler, got %q", refusalHandlerFound, reason)
+	}
+}
+
+// The gates decide whether the signal is sent at all. Without this, inverting
+// the refusal check or moving the send above it leaves every other test green
+// while OBI resumes killing what it cannot identify.
+func TestAttachAgent_RefusalWithholdsTheSignal(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("requires root to enter the target's network namespace")
+	}
+
+	sent := 0
+	restore := sendSIGUSR1
+	sendSIGUSR1 = func(*procs.ProcessHandle) error {
+		sent++
+		return nil
+	}
+	t.Cleanup(func() { sendSIGUSR1 = restore })
+
+	// Not a Node.js runtime, so the first gate refuses it.
+	cmd := exec.Command("sleep", "600")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start sleep: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+
+	pid := app.PID(cmd.Process.Pid)
+	startTime, err := procs.StartTime(pid)
+	if err != nil {
+		t.Fatalf("start time: %v", err)
+	}
+	handle, err := procs.OpenProcessHandle(pid, startTime)
+	if err != nil {
+		t.Fatalf("open handle: %v", err)
+	}
+	t.Cleanup(func() { _ = handle.Close() })
+
+	cfg := obi.DefaultConfig
+	cfg.NodeJS.Enabled = true
+	cfg.TracePrinter = debug.TracePrinterText
+	injector := NewNodeInjector(&cfg)
+
+	target := InjectionTarget{Pid: pid, Process: handle}
+	err = injector.attachAgent(context.Background(), target, testBinaryELF(t))
+
+	// Asserted before the error, so that a regression here reports the signal
+	// rather than whatever the injection went on to fail at afterwards.
+	if sent != 0 {
+		t.Fatalf("SIGUSR1 was sent %d times to a process the gates refused", sent)
+	}
+	if err != nil {
+		t.Fatalf("attachAgent returned an error: %v", err)
+	}
+}

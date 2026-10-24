@@ -1,0 +1,130 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package prom
+
+import (
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"go.opentelemetry.io/obi/pkg/export"
+	"go.opentelemetry.io/obi/pkg/export/attributes"
+	"go.opentelemetry.io/obi/pkg/export/otel/perapp"
+	"go.opentelemetry.io/obi/pkg/internal/netolly/ebpf"
+	"go.opentelemetry.io/obi/pkg/internal/pipe"
+	"go.opentelemetry.io/obi/pkg/pipe/global"
+	"go.opentelemetry.io/obi/pkg/pipe/msg"
+)
+
+var mpConfig = &perapp.GlobalMetricsConfig{Features: export.FeatureNetwork | export.FeatureNetworkInterZone | export.FeatureNetworkFlowPackets}
+
+func TestMetricsExpiration(t *testing.T) {
+	now := syncedClock{now: time.Now()}
+	timeNow = now.Now
+
+	ctx := t.Context()
+
+	registry, promURL := newPrometheusTestServer(t)
+
+	// GIVEN a Prometheus Metrics Exporter with a metrics expire time of 3 minutes
+	metrics := msg.NewQueue[[]*ebpf.Record](msg.ChannelBufferLen(20))
+	exporter, err := NetPrometheusEndpoint(
+		&global.ContextInfo{Prometheus: registry.Manager},
+		&NetPrometheusConfig{
+			Config: &PrometheusConfig{
+				Port:                        registry.Port,
+				Path:                        "/metrics",
+				TTL:                         3 * time.Minute,
+				SpanMetricsServiceCacheSize: 10,
+			},
+			SelectorCfg: &attributes.SelectorConfig{
+				SelectionCfg: attributes.Selection{
+					attributes.NetworkFlow.Section: attributes.InclusionLists{
+						Include: []string{"src_name", "dst_name"},
+					},
+					attributes.NetworkFlowPackets.Section: attributes.InclusionLists{
+						Include: []string{"src_name", "dst_name"},
+					},
+				},
+			},
+			CommonCfg: mpConfig,
+		}, metrics)(ctx)
+	require.NoError(t, err)
+
+	go exporter(ctx)
+
+	// WHEN it receives metrics
+	metrics.Send([]*ebpf.Record{
+		{
+			CommonAttrs: pipe.CommonAttrs{DstName: "bar", SrcName: "foo"},
+			Metrics:     ebpf.NetFlowMetrics{Bytes: 123, Packets: 11},
+		},
+		{
+			CommonAttrs: pipe.CommonAttrs{DstName: "bae", SrcName: "baz"},
+			Metrics:     ebpf.NetFlowMetrics{Bytes: 456, Packets: 33},
+		},
+	})
+
+	// THEN the metrics are exported
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		exported := getMetrics(ct, promURL)
+		assert.Contains(ct, exported, `obi_network_flow_bytes_total{dst_name="bar",src_name="foo"} 123`)
+		assert.Contains(ct, exported, `obi_network_flow_bytes_total{dst_name="bae",src_name="baz"} 456`)
+		assert.Contains(ct, exported, `obi_network_flow_packets_total{dst_name="bar",src_name="foo"} 11`)
+		assert.Contains(ct, exported, `obi_network_flow_packets_total{dst_name="bae",src_name="baz"} 33`)
+	}, timeout, 100*time.Millisecond)
+
+	// AND WHEN it keeps receiving a subset of the initial metrics during the timeout
+	now.Advance(2 * time.Minute)
+	metrics.Send([]*ebpf.Record{
+		{
+			CommonAttrs: pipe.CommonAttrs{DstName: "bar", SrcName: "foo"},
+			Metrics:     ebpf.NetFlowMetrics{Bytes: 123, Packets: 11},
+		},
+	})
+
+	// THEN the refreshed metrics accumulate while the other metrics are still within their timeout
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		m := getMetrics(ct, promURL)
+		assert.Contains(ct, m, `obi_network_flow_bytes_total{dst_name="bar",src_name="foo"} 246`)
+		assert.Contains(ct, m, `obi_network_flow_packets_total{dst_name="bar",src_name="foo"} 22`)
+		assert.Contains(ct, m, `obi_network_flow_bytes_total{dst_name="bae",src_name="baz"} 456`)
+		assert.Contains(ct, m, `obi_network_flow_packets_total{dst_name="bae",src_name="baz"} 33`)
+	}, timeout, 100*time.Millisecond)
+
+	// AND WHEN enough time passes for the metrics that weren't refreshed to expire
+	now.Advance(2 * time.Minute)
+
+	// THEN the refreshed metrics remain visible but the other metrics do not
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		m := getMetrics(ct, promURL)
+		assert.Contains(ct, m, `obi_network_flow_bytes_total{dst_name="bar",src_name="foo"} 246`)
+		assert.Contains(ct, m, `obi_network_flow_packets_total{dst_name="bar",src_name="foo"} 22`)
+		assert.NotContains(ct, m, `obi_network_flow_bytes_total{dst_name="bae",src_name="baz"}`)
+		assert.NotContains(ct, m, `obi_network_flow_packets_total{dst_name="bae",src_name="baz"}`)
+	}, timeout, 100*time.Millisecond)
+	now.Advance(2 * time.Minute)
+
+	// AND WHEN the metrics labels that disappeared are received again
+	metrics.Send([]*ebpf.Record{
+		{
+			CommonAttrs: pipe.CommonAttrs{DstName: "bae", SrcName: "baz"},
+			Metrics:     ebpf.NetFlowMetrics{Bytes: 456, Packets: 33},
+		},
+	})
+	now.Advance(2 * time.Minute)
+
+	// THEN they are reported again, starting from zero in the case of counters
+	var exported string
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		m := getMetrics(ct, promURL)
+		assert.Contains(ct, m, `obi_network_flow_bytes_total{dst_name="bae",src_name="baz"} 456`)
+		assert.Contains(ct, m, `obi_network_flow_packets_total{dst_name="bae",src_name="baz"} 33`)
+		exported = m
+	}, timeout, 100*time.Millisecond)
+	assert.NotContains(t, exported, `obi_network_flow_bytes_total{dst_name="bar",src_name="foo"}`)
+	assert.NotContains(t, exported, `obi_network_flow_packets_total{dst_name="bar",src_name="foo"}`)
+}

@@ -1,0 +1,71 @@
+namespaceOverride: obi-store-demo
+
+image:
+  registry: docker.io
+  repository: otel/ebpf-instrument
+  tag: v0.13.0
+  digest: sha256:5e89d7478b5feeb8ee73881c58bfe5bb0ccb6dcd4f8cd62e30457aa6e6426adb
+
+preset: application
+privileged: true
+
+config:
+  create: true
+  data:
+    attributes:
+      kubernetes:
+        enable: true
+    ebpf:
+      buffer_sizes:
+        # Required for Aerospike spans. Once a connection is classified as
+        # Aerospike the generic tcp buffer no longer applies to it, and this
+        # setting defaults to 0 (disabled) - so without it nothing is captured
+        # and no spans are produced. See devdocs/protocols/tcp/aerospike.md.
+        aerospike: 1024
+    routes:
+      patterns:
+        - /
+        - /product/:product_id
+        - /cart
+        - /cart/empty
+        - /setCurrency
+        - /logout
+        - /cart/checkout
+        - /viewed
+        - /viewed/:product_id
+        - /_healthz
+      unmatched: low-cardinality
+    otel_metrics_export:
+      endpoint: http://${LGTM_SERVICE_HOST}:4318
+    otel_traces_export:
+      endpoint: http://${LGTM_SERVICE_HOST}:4318
+    discovery:
+      exclude_otel_instrumented_services: true
+      instrument:
+        - namespace: obi-store-demo
+          k8s_deployment_name: adservice
+        - namespace: obi-store-demo
+          k8s_deployment_name: cartservice
+        - namespace: obi-store-demo
+          k8s_deployment_name: checkoutservice
+        - namespace: obi-store-demo
+          k8s_deployment_name: currencyservice
+        - namespace: obi-store-demo
+          k8s_deployment_name: emailservice
+        - namespace: obi-store-demo
+          k8s_deployment_name: frontend
+        - namespace: obi-store-demo
+          k8s_deployment_name: paymentservice
+        - namespace: obi-store-demo
+          k8s_deployment_name: productcatalogservice
+        - namespace: obi-store-demo
+          k8s_deployment_name: recentlyviewed
+        - namespace: obi-store-demo
+          k8s_deployment_name: recommendationservice
+        - namespace: obi-store-demo
+          k8s_deployment_name: shippingservice
+
+env:
+  OTEL_EBPF_DISCOVERY_POLL_INTERVAL: 5s
+  OTEL_EBPF_METRICS_INTERVAL: 30s
+  OTEL_EBPF_NAME_RESOLVER_SOURCES: k8s,dns

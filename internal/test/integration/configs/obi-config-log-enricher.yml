@@ -1,0 +1,26 @@
+routes:
+  patterns:
+    - /basic/:rnd
+  unmatched: path
+  ignored_patterns:
+    - /metrics
+attributes:
+  kubernetes:
+    cluster_name: obi-k8s-test-cluster
+    resource_labels:
+      deployment.environment: ["deployment.environment"]
+  select:
+    "*":
+      include: ["*"]
+ebpf:
+  log_enricher:
+    # The log enricher selects the suite's target with the same variables as the
+    # instrumentation selection (OTEL_EBPF_OPEN_PORT, OTEL_EBPF_EXECUTABLE_PATH),
+    # so the two selections cannot drift. The defaults match nothing.
+    services:
+      - service:
+        - open_ports: "${OTEL_EBPF_OPEN_PORT:-0}"
+        - exe_path: "*${OTEL_EBPF_EXECUTABLE_PATH:-@none@}*"
+discovery:
+  min_process_age: "0s"
+log_config: "yaml"
