@@ -115,10 +115,41 @@ func (pf *PIDsFilter) ValidPID(userPID app.PID, ns uint32, pidType PIDType) bool
 					return true
 				}
 			}
+			return false
+		}
+		if sole := soleService(ns); sole != nil {
+			return sole.pidTypes&pidType != 0
 		}
 	}
 
 	return false
+}
+
+// soleService returns a live process of the namespace when every live process
+// in it belongs to one named service, nil otherwise. BPF only admits a pid
+// discovery has not seen yet through its selected parent, so a child that exits
+// before the next scan belongs to that service.
+func soleService(ns map[app.PID]PIDInfo) *PIDInfo {
+	var sole *PIDInfo
+	var id svc.ServiceNameNamespace
+	for pid := range ns {
+		info := ns[pid]
+		if info.removedAt != 0 || info.fileInfo == nil {
+			continue
+		}
+		uid := info.fileInfo.UnsafeServiceAttrs().UID
+		if uid.Name == "" {
+			return nil
+		}
+		if sole == nil {
+			sole, id = &info, uid.NameNamespace()
+			continue
+		}
+		if uid.NameNamespace() != id {
+			return nil
+		}
+	}
+	return sole
 }
 
 // The generation of the process that was alive when the span was captured, nil
@@ -205,7 +236,11 @@ func (pf *PIDsFilter) Filter(inputSpans []request.Span) []request.Span {
 		// of container layers. The Host PID is always the outer most layer.
 		info, pidExists := ns[span.Pid.UserPID]
 		if !pidExists {
-			continue
+			sole := soleService(ns)
+			if sole == nil {
+				continue
+			}
+			info = *sole
 		}
 		if gen := generationFor(&info, span); gen != nil {
 			if pf.ignoreOtel {

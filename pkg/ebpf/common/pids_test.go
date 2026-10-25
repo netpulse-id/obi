@@ -674,3 +674,64 @@ func TestProcPIDsBlocksTheRightProcessUnderCollision(t *testing.T) {
 
 	assert.ElementsMatch(t, []app.PID{90000}, pf.ProcPIDs(PIDTypeKProbes))
 }
+
+func namedFileInfo(name string) *exec.FileInfo {
+	return exec.New(exec.Init{Service: svc.Attrs{UID: svc.UID{Name: name, Namespace: "lab"}}})
+}
+
+// a child forked by a selected process and gone before the next discovery scan
+// is attributed to the one service its pid namespace holds
+func TestFilter_UnknownPidOfSoleService(t *testing.T) {
+	readNamespacePIDs = func(pid app.PID) ([]app.PID, error) {
+		return []app.PID{pid}, nil
+	}
+	pf := NewPIDsFilter(&services.DiscoveryConfig{}, slog.With("env", "testing"), &imetrics.NoopReporter{})
+	pf.AllowPID(1, 33, namedFileInfo("loadgen"), PIDTypeKProbes)
+	pf.AllowPID(7, 33, namedFileInfo("loadgen"), PIDTypeKProbes)
+
+	assert.True(t, pf.ValidPID(50, 33, PIDTypeKProbes))
+	assert.False(t, pf.ValidPID(50, 33, PIDTypeGo))
+
+	out := pf.Filter([]request.Span{{Pid: request.PidInfo{UserPID: 50, HostPID: 950, Namespace: 33}}})
+	require.Len(t, out, 1)
+	assert.Equal(t, "loadgen", out[0].Service.UID.Name)
+	assert.Equal(t, app.PID(50), out[0].Pid.UserPID)
+}
+
+func TestFilter_UnknownPidOfSharedNamespaceDropped(t *testing.T) {
+	readNamespacePIDs = func(pid app.PID) ([]app.PID, error) {
+		return []app.PID{pid}, nil
+	}
+	pf := NewPIDsFilter(&services.DiscoveryConfig{}, slog.With("env", "testing"), &imetrics.NoopReporter{})
+	pf.AllowPID(1, 33, namedFileInfo("loadgen"), PIDTypeKProbes)
+	pf.AllowPID(7, 33, namedFileInfo("orders"), PIDTypeKProbes)
+
+	assert.False(t, pf.ValidPID(50, 33, PIDTypeKProbes))
+	assert.Empty(t, pf.Filter([]request.Span{{Pid: request.PidInfo{UserPID: 50, HostPID: 950, Namespace: 33}}}))
+}
+
+func TestFilter_UnknownPidOfUnknownNamespaceDropped(t *testing.T) {
+	readNamespacePIDs = func(pid app.PID) ([]app.PID, error) {
+		return []app.PID{pid}, nil
+	}
+	pf := NewPIDsFilter(&services.DiscoveryConfig{}, slog.With("env", "testing"), &imetrics.NoopReporter{})
+	pf.AllowPID(1, 33, namedFileInfo("loadgen"), PIDTypeKProbes)
+
+	assert.False(t, pf.ValidPID(50, 44, PIDTypeKProbes))
+	assert.Empty(t, pf.Filter([]request.Span{{Pid: request.PidInfo{UserPID: 50, HostPID: 950, Namespace: 44}}}))
+}
+
+func TestFilter_UnknownPidAfterServiceRemovedDropped(t *testing.T) {
+	readNamespacePIDs = func(pid app.PID) ([]app.PID, error) {
+		return []app.PID{pid}, nil
+	}
+	now := time.Hour
+	pidsFilterMonoNow = func() time.Duration { return now }
+	t.Cleanup(func() { pidsFilterMonoNow = timing.MonoTimeNow })
+	pf := NewPIDsFilter(&services.DiscoveryConfig{}, slog.With("env", "testing"), &imetrics.NoopReporter{})
+	pf.AllowPID(1, 33, namedFileInfo("loadgen"), PIDTypeKProbes)
+	pf.BlockPID(1, 33)
+
+	assert.False(t, pf.ValidPID(50, 33, PIDTypeKProbes))
+	assert.Empty(t, pf.Filter([]request.Span{{Pid: request.PidInfo{UserPID: 50, HostPID: 950, Namespace: 33}, End: int64(now + time.Second)}}))
+}
