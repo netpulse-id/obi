@@ -151,6 +151,71 @@ func TestHandlePostgresTruncatedParse(t *testing.T) {
 	})
 }
 
+// pgxCachedStatementRequest is what pgx writes for a statement its cache prepared earlier on the
+// connection: Bind of a named statement with one binary int4 parameter, Execute and Sync
+func pgxCachedStatementRequest() []byte {
+	bind := []byte{0}
+	bind = append(bind, "stmtcache_2834698fd487a34768505f6f98873c641d09d7e7f1dc2208"...)
+	bind = append(bind, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 4, 0, 0, 0, 5, 0, 2, 0, 0, 0, 1)
+
+	req := postgresTestPacket('B', bind)
+	req = append(req, postgresTestPacket('E', []byte{0, 0, 0, 0, 0})...)
+	return append(req, postgresTestPacket('S', nil)...)
+}
+
+func TestHandlePostgresUnseenStatement(t *testing.T) {
+	t.Run("an executed statement prepared out of view makes an EXECUTE span", func(t *testing.T) {
+		response := postgresTestPacket('2', nil)
+		response = append(response, postgresTestPacket('D', []byte{0, 1, 0, 0, 0, 1, 7})...)
+		response = append(response, postgresTestPacket('C', []byte("SELECT 1\x00"))...)
+		response = append(response, postgresTestPacket('Z', []byte{'I'})...)
+
+		span, err := handlePostgres(
+			newPostgresTestContext(),
+			&TCPRequestInfo{IsServer: true},
+			largebuf.NewLargeBufferFrom(pgxCachedStatementRequest()),
+			largebuf.NewLargeBufferFrom(response),
+		)
+
+		require.NoError(t, err)
+		assert.Equal(t, request.EventTypeSQLServer, span.Type)
+		assert.Equal(t, "EXECUTE", span.Method)
+		assert.Empty(t, span.Path)
+		assert.Empty(t, span.Statement)
+		assert.Equal(t, "EXECUTE", span.SQLCommand)
+		assert.Equal(t, 0, span.Status)
+	})
+
+	t.Run("a failed execution keeps its error", func(t *testing.T) {
+		response := postgresTestPacket('2', nil)
+		response = append(response, postgresErrorResponse("23505", "duplicate key")...)
+
+		span, err := handlePostgres(
+			newPostgresTestContext(),
+			&TCPRequestInfo{IsServer: true},
+			largebuf.NewLargeBufferFrom(pgxCachedStatementRequest()),
+			largebuf.NewLargeBufferFrom(response),
+		)
+
+		require.NoError(t, err)
+		assert.Equal(t, "EXECUTE", span.Method)
+		assert.Equal(t, 1, span.Status)
+		assert.Equal(t, "23505", span.SQLError.SQLState)
+	})
+
+	t.Run("a reply that executed nothing makes no span", func(t *testing.T) {
+		span, err := handlePostgres(
+			newPostgresTestContext(),
+			&TCPRequestInfo{IsServer: true},
+			largebuf.NewLargeBufferFrom(pgxCachedStatementRequest()),
+			largebuf.NewLargeBufferFrom(postgresTestPacket('2', nil)),
+		)
+
+		require.ErrorIs(t, err, errIgnore)
+		assert.Empty(t, span)
+	})
+}
+
 func TestPostgresMessagesIterator(t *testing.T) {
 	tests := []struct {
 		name    string

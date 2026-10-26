@@ -529,6 +529,8 @@ func handlePostgres(parseCtx *EBPFParseContext, event *TCPRequestInfo, requestBu
 		msg      postgresMessage
 		it       = postgresMessageIterator{r: reqR}
 		sqlError = response.sqlError
+		// Set when an EXECUTE names a statement or portal this connection never showed being prepared
+		unseenStatement bool
 	)
 
 Loop:
@@ -589,6 +591,7 @@ Loop:
 			stmtName, found := parseCtx.postgresPortals.Get(portalKey)
 			if !found {
 				slog.Debug("Postgres EXECUTE command with unknown portal", "portal", portalKey.portalName)
+				unseenStatement = true
 				continue
 			}
 
@@ -600,6 +603,7 @@ Loop:
 			stmt, found = parseCtx.postgresPreparedStatements.Get(preparedStmtKey)
 			if !found {
 				slog.Debug("Postgres EXECUTE command with unknown statement", "stmtName", stmtName)
+				unseenStatement = true
 				continue
 			}
 
@@ -609,6 +613,14 @@ Loop:
 		default:
 			continue
 		}
+	}
+
+	// A statement prepared before the connection was seen (a pooled connection older than
+	// the instrumentation, or an evicted cache entry) still makes its span, without its text
+	if !hasSpan && unseenStatement && (response.executed || sqlError != nil) {
+		op, tables, stmt = "EXECUTE", nil, ""
+		msg.typ = "EXECUTE"
+		hasSpan = true
 	}
 
 	if !hasSpan {

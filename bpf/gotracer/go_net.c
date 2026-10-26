@@ -236,6 +236,7 @@ int GUARDED_PROG(obi_uprobe_netFdWrite, struct pt_regs *, ctx) {
 
         if (already_handled_request_sorted(&p_conn.conn)) {
             cleanup_duplicate_generic_events_sorted(&p_conn);
+            publish_sql_client_trace(&g_key, &p_conn.conn);
 
             if (!http_large_buffer_skip(len)) {
                 send_http_large_buffers_if_needed(&g_key, &p_conn.conn, (void *)buf, len, TCP_SEND);

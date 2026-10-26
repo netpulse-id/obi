@@ -24,6 +24,7 @@
 #include <common/connection_info.h>
 #include <common/go_addr_key.h>
 
+#include <gotracer/go_client_trace.h>
 #include <gotracer/go_common.h>
 #include <gotracer/maps/mongo.h>
 
@@ -66,6 +67,16 @@ cleanup_duplicate_generic_event_by_connection(const connection_info_t *conn) {
     sort_connection_info(&p_conn.conn);
 
     cleanup_duplicate_generic_events_sorted(&p_conn);
+}
+
+// Publishes the SQL query the goroutine runs as the parent of the server side of the
+// connection it writes to
+static __always_inline void publish_sql_client_trace(go_addr_key_t *g_key,
+                                                     const connection_info_t *conn) {
+    sql_func_invocation_t *invocation = bpf_map_lookup_elem(&ongoing_sql_queries, g_key);
+    if (invocation) {
+        publish_client_trace(conn, &invocation->tp);
+    }
 }
 
 static __always_inline connection_info_t *already_handled_goroutine(go_addr_key_t *g_key,

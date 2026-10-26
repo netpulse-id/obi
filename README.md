@@ -2,9 +2,11 @@
 
 > **This fork** (`github.com/netpulse-id/obi`) is the module the go-codebase-agent sensor builds against. Each `<release>-np.<N>` tag holds the upstream release's source, the patches in the agent's `scripts/obi-patches/` applied in order, and the eBPF objects `scripts/generate-obi.sh` generates from that tree, which the upstream tag does not hold. Nothing else. A patch stays until an upstream release carries its fix.
 >
-> `v1.0.0-rc.2-np.2` carries two patches:
+> `v1.0.0-rc.2-np.3` carries four patches:
 > - `0001-forked-child-spans-keep-their-service`: a span from a pid that discovery has not seen yet (a forked short-lived child BPF admitted through its selected parent) goes to the one named service of its pid namespace, not dropped (upstream #3481).
-> - `0002-go-redis-publishes-its-client-trace`: the go-redis client publishes its span for its connection, so the redis server span takes it as its parent.
+> - `0002-go-redis-publishes-its-client-trace`: the go-redis client publishes its span for its connection, so the redis server span takes it as its parent. The publishing helpers live in `bpf/gotracer/go_client_trace.h`.
+> - `0003-postgres-statements-prepared-out-of-view-keep-their-span`: a Postgres EXECUTE of a statement prepared before the connection was seen (a pooled connection older than the instrumentation, or an evicted cache entry) makes an `EXECUTE` span without its text instead of none.
+> - `0004-go-sql-publishes-its-client-trace`: a Go `database/sql` or pgx query publishes its client span for the connection it writes to, so the database server span takes it as its parent.
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/open-telemetry/opentelemetry-ebpf-instrumentation)
 

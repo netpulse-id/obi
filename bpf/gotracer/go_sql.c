@@ -24,6 +24,7 @@
 #include <common/preempt_guard.h>
 #include <common/ringbuf.h>
 
+#include <gotracer/go_client_trace.h>
 #include <gotracer/go_common.h>
 #include <gotracer/go_str.h>
 
@@ -333,6 +334,10 @@ static __always_inline int process_sql_return(void *goroutine_addr, u8 error, u8
         go_obi_ctx__end(&g_key, k_obi_ctx_sql, NULL);
         return 0;
     }
+    if (invocation->conn.s_port || invocation->conn.d_port) {
+        unpublish_client_trace(&invocation->conn);
+    }
+
     go_obi_ctx__end(&g_key, k_obi_ctx_sql, &invocation->tp);
     bpf_map_delete_elem(&ongoing_sql_queries, &g_key);
 
