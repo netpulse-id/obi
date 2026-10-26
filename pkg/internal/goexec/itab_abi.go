@@ -8,6 +8,7 @@ import (
 	"debug/elf"
 	"errors"
 	"fmt"
+	stdlibversion "go/version"
 	"strings"
 
 	trackeroffsets "github.com/grafana/go-offsets-tracker/pkg/offsets"
@@ -120,5 +121,9 @@ func generatedVersionCovered(targetVersion goversion.Version, oldestValue, newes
 	if err != nil {
 		return false, err
 	}
-	return targetVersion.Compare(oldest) >= 0 && targetVersion.Compare(newest) <= 0, nil
+	if targetVersion.Compare(oldest) < 0 {
+		return false, nil
+	}
+	// A later patch release of the newest generated Go minor takes that minor's newest facts
+	return targetVersion.Compare(newest) <= 0 || stdlibversion.Lang(targetVersion.String()) == stdlibversion.Lang(newest.String()), nil
 }

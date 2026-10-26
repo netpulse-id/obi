@@ -112,6 +112,8 @@ func TestLoadGeneratedGoRuntimeABI(t *testing.T) {
 		"1.27.2",
 		"go1.27.2",
 		"go1.26.2-X:nodwarf5",
+		"go1.27.3",
+		"go1.27.999",
 	} {
 		t.Run(goVersion, func(t *testing.T) {
 			_, err := loadGeneratedGoRuntimeABI(goversion.MustParse(goVersion))
@@ -122,7 +124,8 @@ func TestLoadGeneratedGoRuntimeABI(t *testing.T) {
 	for _, goVersion := range []string{
 		"go1.26.2-custom",
 		"go1.26.2-X:arenas",
-		"go1.27.999",
+		"go1.28.0",
+		"go1.28rc1",
 		"go999.0.0",
 	} {
 		t.Run(goVersion, func(t *testing.T) {
@@ -130,6 +133,30 @@ func TestLoadGeneratedGoRuntimeABI(t *testing.T) {
 			require.ErrorContains(t, err, "runtime ABI is not generated")
 		})
 	}
+}
+
+func TestGeneratedVersionCovered(t *testing.T) {
+	for _, tc := range []struct {
+		target  string
+		covered bool
+	}{
+		{target: "go1.16.15", covered: false},
+		{target: "go1.17.0", covered: true},
+		{target: "go1.27.3", covered: true},
+		{target: "go1.27.4", covered: true},
+		{target: "go1.27.12", covered: true},
+		{target: "go1.28rc1", covered: false},
+		{target: "go1.28.0", covered: false},
+	} {
+		t.Run(tc.target, func(t *testing.T) {
+			covered, err := generatedVersionCovered(goversion.MustParse(tc.target), "1.17.0", "1.27.3")
+			require.NoError(t, err)
+			assert.Equal(t, tc.covered, covered)
+		})
+	}
+
+	_, err := generatedVersionCovered(goversion.MustParse("go1.27.3"), "1.17.0", "not-a-version")
+	require.Error(t, err)
 }
 
 func TestFindInterfaceImplsRejectsUngeneratedVersionWithoutDWARF(t *testing.T) {
