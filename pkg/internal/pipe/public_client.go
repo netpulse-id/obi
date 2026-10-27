@@ -12,8 +12,6 @@ import (
 const (
 	// PublicClientsV4 is what the client end of a connection is reported as when it is a public IPv4 address.
 	PublicClientsV4 = "0.0.0.0/0"
-	// PublicClientsV6 is what the client end of a connection is reported as when it is a public IPv6 address.
-	PublicClientsV6 = "::/0"
 
 	// hostAddrsRefresh is how often the addresses of the host's own interfaces are read again.
 	hostAddrsRefresh = 30 * time.Second
@@ -80,17 +78,18 @@ func localEnd(ip net.IP, hostIP string, now time.Time) bool {
 }
 
 // PublicClient returns what the client end of a connection is reported as when it is a
-// remote public address calling a server end that is private or the host's own, so the
+// remote public IPv4 address calling a server end that is private or the host's own, so the
 // connections of every public client of a host fold into one value per local end; false for
-// any other pair, so a pod with a global address keeps its own end.
+// any other pair and for every IPv6 client, so a pod with a global address keeps its own end.
 func PublicClient(client, server *IPAddr, hostIP string) (string, bool) {
-	now := time.Now()
 	ip := client.IP()
+	// A global IPv6 address may be a pod's of this node, which no address class tells from an internet client's.
+	if ip.To4() == nil {
+		return "", false
+	}
+	now := time.Now()
 	if !remotePublic(ip, hostIP, now) || !localEnd(server.IP(), hostIP, now) {
 		return "", false
 	}
-	if ip.To4() != nil {
-		return PublicClientsV4, true
-	}
-	return PublicClientsV6, true
+	return PublicClientsV4, true
 }

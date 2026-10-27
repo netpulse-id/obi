@@ -43,7 +43,7 @@ func TestStatGetters_APublicClientOfAServerSocketIsCollapsed(t *testing.T) {
 	assert.Equal(t, "10.0.0.6", dst(private).Value.AsString())
 
 	v6 := stat("fd00::5", "2606:4700::7", CodeRoleServer)
-	assert.Equal(t, pipe.PublicClientsV6, dst(v6).Value.AsString())
+	assert.Equal(t, "2606:4700::7", dst(v6).Value.AsString(), "an IPv6 client keeps its address")
 
 	rtt := &Stat{Type: StatTypeTCPRtt, TCPRtt: &TCPRtt{Role: uint8(CodeRoleServer)}, CommonAttrs: pipe.CommonAttrs{SrcAddr: ip("10.0.0.5"), DstAddr: ip("8.8.4.4")}}
 	assert.Equal(t, pipe.PublicClientsV4, dst(rtt).Value.AsString())
