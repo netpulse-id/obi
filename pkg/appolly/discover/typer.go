@@ -162,6 +162,9 @@ func (t *typer) makeServiceAttrs(processMatch *ProcessMatch) svc.Attrs {
 	}
 
 	routesCfg := t.cfg.Routes
+	if routesCfg != nil && routesCfg.MaxRoutesPerService > 0 {
+		s.RouteCap = clusterurl.NewRouteCap(routesCfg.MaxRoutesPerService, nil)
+	}
 	if routesCfg != nil && routesCfg.Directional != nil {
 		policies := routesCfg.DirectionalPolicies()
 		var overrides *services.DirectionalRoutePolicyOverrides

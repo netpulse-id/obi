@@ -522,3 +522,33 @@ func filterIgnored(reader func() []request.Span) []request.Span {
 		}
 	}
 }
+
+func TestUnmatchedHeuristicCapsServerRoutesPerService(t *testing.T) {
+	input := msg.NewQueue[[]request.Span](msg.ChannelBufferLen(10))
+	output := msg.NewQueue[[]request.Span](msg.ChannelBufferLen(10))
+	router, err := RoutesProvider(&RoutesConfig{Unmatch: UnmatchHeuristic, WildcardChar: "*", MaxRoutesPerService: 2},
+		input, output)(t.Context())
+	require.NoError(t, err)
+	out := output.Subscribe()
+	defer input.Close()
+	go router(t.Context())
+
+	capped := svc.Attrs{UID: svc.UID{Name: "shop"}, RouteCap: clusterurl.NewRouteCap(2, nil)}
+	routes := func(spans []request.Span) []string {
+		got := make([]string, 0, len(spans))
+		for _, s := range spans {
+			got = append(got, s.Route)
+		}
+		return got
+	}
+	input.Send([]request.Span{
+		{Path: "/cart", Type: request.EventTypeHTTP, Service: capped},
+		{Path: "/user/1234", Type: request.EventTypeHTTP, Service: capped},
+		{Path: "/x/abcd", Type: request.EventTypeHTTP, Service: capped},
+		{Path: "/cart", Type: request.EventTypeHTTP, Service: capped},
+		{Path: "/x/abce", Type: request.EventTypeHTTPClient, Service: capped},
+		{Path: "/x/abcf", Type: request.EventTypeHTTP},
+	})
+	assert.Equal(t, []string{"/cart", "/user/*", clusterurl.OverflowRoute, "/cart", "/x/abce", "/x/abcf"},
+		routes(testutil.ReadChannel(t, out, testTimeout)))
+}

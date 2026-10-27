@@ -74,6 +74,9 @@ type RoutesConfig struct {
 	// Max allowed path segment cardinality (per service) for the heuristic matcher
 	// 0 = disabled
 	MaxPathSegmentCardinality int `yaml:"max_path_segment_cardinality" validate:"gte=0"`
+	// Max distinct server routes (per service) the heuristic reports; a new route past it
+	// is reported as clusterurl.OverflowRoute until an idle route frees its room. 0 = disabled
+	MaxRoutesPerService int `yaml:"max_routes_per_service" validate:"gte=0"`
 
 	// Directional is populated only by config v2 conversion. The fields above
 	// remain the complete v1 YAML surface.
@@ -314,6 +317,7 @@ func (rn *routerNode) applyDirectionalPolicy(span *request.Span) {
 				span.Route = pathTrie.Insert(span.Route)
 			}
 		}
+		span.Route = capServerRoute(span, span.Route)
 	case services.UnmatchWildcard, "":
 		span.Route = wildCard
 	default:
@@ -465,7 +469,7 @@ func setUnmatchToPath(_ *routerNode, str *request.Span) {
 
 func classifyFromPath(rc *routerNode, s *request.Span) {
 	if s.Route == "" && s.IsHTTPSpan() {
-		s.Route = rc.classifier.ClusterURL(s.Path)
+		s.Route = capServerRoute(s, rc.classifier.ClusterURL(s.Path))
 	}
 }
 
@@ -475,7 +479,16 @@ func classifyFromPathWithCappedCardinality(rc *routerNode, s *request.Span) {
 		if s.Service.PathTrie != nil {
 			s.Route = s.Service.PathTrie.Insert(s.Route)
 		}
+		s.Route = capServerRoute(s, s.Route)
 	}
+}
+
+// capServerRoute passes a heuristic route of a server span through its service's route cap
+func capServerRoute(s *request.Span, route string) string {
+	if s.IsClientSpan() {
+		return route
+	}
+	return s.Service.RouteCap.Admit(route)
 }
 
 func setSpanIgnoreMode(mode IgnoreMode, s *request.Span) {

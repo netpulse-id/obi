@@ -153,6 +153,8 @@ type Attrs struct {
 	OutgoingPathTrie      *clusterurl.PathTrie
 	HarvestedRouteMatcher route.Matcher
 	PathTrie              *clusterurl.PathTrie
+	// RouteCap bounds the distinct heuristic server routes of the service
+	RouteCap *clusterurl.RouteCap
 }
 
 // RoutePolicy contains the compiled, direction-specific route state attached
