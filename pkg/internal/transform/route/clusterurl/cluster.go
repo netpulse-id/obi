@@ -118,6 +118,10 @@ func (csf *ClusterURLClassifier) ClusterURL(path string) string {
 			}
 
 			if nSegments >= csf.cfg.MaxSegments {
+				// the route ends at the judged segment, so the tail after the loop adds nothing
+				p = p[:sPos]
+				sFwd = sPos
+				skip = false
 				break
 			}
 

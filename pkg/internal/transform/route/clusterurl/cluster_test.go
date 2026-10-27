@@ -162,6 +162,11 @@ func TestClusterURLKeepsShortWordsAndWellKnown(t *testing.T) {
 		"/x/" + strings.Repeat("a", 70) + "&": "/x/*",
 		// A segment longer than 64 bytes is an identifier even when its parts are short words.
 		"/x/" + strings.Repeat("ab-", 23) + "a": "/x/*",
+		// At the ten-segment limit the route ends at the judged ninth segment.
+		"/a/b/c/d/e/f/g/h/.env/z":                            "/a/b/c/d/e/f/g/h/*",
+		"/a/b/c/d/e/f/g/h/x<<y/z":                            "/a/b/c/d/e/f/g/h/*",
+		"/a/b/c/d/e/f/g/h/" + strings.Repeat("a", 65) + "/z": "/a/b/c/d/e/f/g/h/*",
+		"/a/b/c/d/e/f/g/h/i/j":                               "/a/b/c/d/e/f/g/h/i",
 	} {
 		assert.Equal(t, want, csf.ClusterURL(path), path)
 	}
