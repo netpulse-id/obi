@@ -178,8 +178,9 @@ static __always_inline void grpc_server_conn_info(void *tr, connection_info_t *c
         bpf_probe_read_user(&conn_ptr, sizeof(conn_ptr), conn_iface + k_go_iface_data_offset);
     }
 
-    if (conn_ptr) {
-        get_conn_info(conn_ptr, conn);
+    // A failed or half-read connection of a wrapped net.Conn is left unknown, for the netFD read of the transport to fill.
+    if (conn_ptr && (!get_conn_info(conn_ptr, conn) || conn->d_port == 0 || conn->s_port == 0)) {
+        __builtin_memset(conn, 0, sizeof(*conn));
     }
 }
 

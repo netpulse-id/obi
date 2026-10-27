@@ -89,7 +89,7 @@ static __always_inline connection_info_t *already_handled_goroutine(go_addr_key_
         grpc_transports_t *t = bpf_map_lookup_elem(&ongoing_grpc_transports, tr);
         bpf_dbg_printk("t=%llx", t);
         if (t) {
-            if (t->conn.d_port == 0 && t->conn.s_port == 0) {
+            if (t->conn.d_port == 0 || t->conn.s_port == 0) {
                 get_conn_info_from_fd(fd_ptr,
                                       &t->conn,
                                       true); // ok to not check the result, we leave it as 0
@@ -125,7 +125,7 @@ static __always_inline connection_info_t *already_handled_goroutine(go_addr_key_
     connection_info_t *conn = bpf_map_lookup_elem(&ongoing_server_connections, g_key);
     bpf_dbg_printk("conn=%llx", conn);
     if (conn) {
-        if (conn->d_port == 0 && conn->s_port == 0) {
+        if (conn->d_port == 0 || conn->s_port == 0) {
             bpf_dbg_printk("Found existing server connection, parsing FD information for socket "
                            "tuples, goroutine_addr=%llx",
                            g_key->addr);

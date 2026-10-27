@@ -281,8 +281,8 @@ int GUARDED_PROG(obi_uprobe_readRequestStart, struct pt_regs *, ctx) {
     connection_info_t *existing = bpf_map_lookup_elem(&ongoing_server_connections, &g_key);
 
     // Populate connection info if: no entry exists yet, OR the entry was created by connServe
-    // with zeroed ports
-    if (!existing || (existing->d_port == 0 && existing->s_port == 0)) {
+    // with zeroed ports, OR one of its ports is unknown
+    if (!existing || existing->d_port == 0 || existing->s_port == 0) {
         void *c_ptr = GO_PARAM1(ctx);
         if (c_ptr) {
             void *conn_conn_ptr = c_ptr + k_go_iface_data_offset +
@@ -311,9 +311,11 @@ int GUARDED_PROG(obi_uprobe_readRequestStart, struct pt_regs *, ctx) {
                 bpf_dbg_printk("conn_ptr=%llx", conn_ptr);
                 if (conn_ptr) {
                     connection_info_t conn = {0};
-                    get_conn_info(
-                        conn_ptr,
-                        &conn); // initialized to 0, no need to check the result if we succeeded
+                    // A failed or half-read connection of a wrapped net.Conn is stored as unknown, for the netFD read on this goroutine to fill.
+                    if (!get_conn_info(conn_ptr, &conn) || conn.d_port == 0 || conn.s_port == 0) {
+                        bpf_dbg_printk("can't read server connection, leaving it to the netFD read");
+                        __builtin_memset(&conn, 0, sizeof(conn));
+                    }
                     bpf_map_update_elem(&ongoing_server_connections, &g_key, &conn, BPF_ANY);
                 }
             }
