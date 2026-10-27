@@ -163,28 +163,62 @@ func (csf *ClusterURLClassifier) okWord(w string) bool {
 		return ok
 	}
 
+	// A single leading dot names a hidden or well-known segment, such as ".well-known".
 	start := 0
+	if len(w) > 1 && w[0] == '.' {
+		start = 1
+	}
+	afterDot := false
 	for i, c := range w {
+		if i < start {
+			continue
+		}
 		if c == '-' || c == '_' || c == '.' {
 			if i == start {
 				return false
 			}
 
-			if gibberish.IsGibberish(w[start:i], csf.classifier) {
+			if !csf.wordPart(w[start:i], afterDot) {
 				return false
 			}
 
 			start = i + 1
+			afterDot = c == '.'
 		}
 	}
 
 	if start < len(w) {
-		if gibberish.IsGibberish(w[start:], csf.classifier) {
+		if !csf.wordPart(w[start:], afterDot) {
 			return false
 		}
 	}
 
 	csf.cache.Add(w, true)
+	return true
+}
+
+// shortWordLen is the longest letters-only part taken as a word without the model, which judges acronyms such as "apm" or "ocsp" as identifiers.
+const shortWordLen = 4
+
+// wordPart reports whether one part of a segment reads as a word: a letters-only part of at most shortWordLen letters that is no file extension, else the model's judgment.
+func (csf *ClusterURLClassifier) wordPart(part string, afterDot bool) bool {
+	if !afterDot && len(part) <= shortWordLen && lettersOnly(part) {
+		return true
+	}
+	return !gibberish.IsGibberish(part, csf.classifier)
+}
+
+// lettersOnly reports whether a non-empty string holds ASCII letters only.
+func lettersOnly(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') {
+			return false
+		}
+	}
 	return true
 }
 

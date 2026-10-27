@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 //nolint:testifylint
@@ -124,5 +125,32 @@ func BenchmarkClusterURLWithoutCache(b *testing.B) {
 		for _, testCase := range testCases {
 			_ = csf.ClusterURL(testCase)
 		}
+	}
+}
+
+func TestClusterURLKeepsShortAndDotLedWords(t *testing.T) {
+	csf, err := NewClusterURLClassifier(DefaultConfig())
+	require.NoError(t, err)
+	for path, want := range map[string]string{
+		"/api/v1/apm/endpoints":                       "/api/v1/apm/endpoints",
+		"/api/v1/certmanager/ocsp":                    "/api/v1/certmanager/ocsp",
+		"/storage/agent/tuf/timestamp.json":           "/storage/agent/tuf/timestamp.json",
+		"/.well-known/jwks.json":                      "/.well-known/jwks.json",
+		"/.well-known/openid-configuration":           "/.well-known/openid-configuration",
+		"/api/v1/tenants/6adeea895ed8aef860efcdcf":    "/api/v1/tenants/*",
+		"/users/6f1c2a0e-9d7b-4c1e-8a55-3b2f1d0c9e7a": "/users/*",
+		"/releases/v0.3.182-rc.2/tsa-chain.pem":       "/releases/*/tsa-chain.pem",
+		"/storage/agent/tuf/2.root.json":              "/storage/agent/tuf/*",
+		"/x/zxqvbn":                                   "/x/*",
+		"/x/abcdef":                                   "/x/*",
+		"/x/fdbcaeaf":                                 "/x/*",
+		"/files/README.md":                            "/files/*",
+		"/files/some-file.txt":                        "/files/*",
+		// A letters-only identifier of at most four letters reads as a word.
+		"/codes/xkqz": "/codes/xkqz",
+		"/x/.":        "/x/*",
+		"/x/..":       "/x/*",
+	} {
+		assert.Equal(t, want, csf.ClusterURL(path), path)
 	}
 }
