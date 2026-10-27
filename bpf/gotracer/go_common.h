@@ -237,18 +237,20 @@ static __always_inline void tp_clone(tp_info_t *dest, tp_info_t *src) {
 // The server ports on which an incoming trace context is never continued, zero for an unused slot.
 volatile const u16 g_ctx_skip_server_ports[8];
 
-// ctx_skipped_server reports whether a server connection is on a port whose incoming trace context is never continued.
+// ctx_skipped_server reports whether a server connection is on a port whose incoming trace context is never continued, or, with any port set, whether its connection is unknown.
 static __always_inline u8 ctx_skipped_server(const connection_info_t *conn) {
-    if (!conn) {
-        return 0;
-    }
+    u8 any = 0;
     for (int i = 0; i < 8; i++) {
         const u16 port = g_ctx_skip_server_ports[i];
-        if (port && (conn->s_port == port || conn->d_port == port)) {
+        if (!port) {
+            continue;
+        }
+        any = 1;
+        if (conn && (conn->s_port == port || conn->d_port == port)) {
             return 1;
         }
     }
-    return 0;
+    return any && (!conn || !conn->s_port || !conn->d_port);
 }
 
 static __always_inline void server_trace_parent(void *goroutine_addr,

@@ -96,7 +96,7 @@ type EBPFTracer struct {
 	// Disables OBI black-box context propagation. Used for testing purposes only.
 	DisableBlackBoxCP bool `yaml:"disable_black_box_cp" env:"OTEL_EBPF_BPF_DISABLE_BLACK_BOX_CP" validate:"boolean"`
 
-	// The server ports on which the Go server probes never continue an incoming trace context, at most MaxContextSkipServerPorts.
+	// The server ports on which the Go HTTP and gRPC server probes never continue an incoming trace context, at most MaxContextSkipServerPorts; while any is set, a server request whose connection is unknown continues none either.
 	ContextPropagationSkipServerPorts []uint16 `yaml:"context_propagation_skip_server_ports"`
 
 	// Optimizes for getting requests information immediately when request response is seen
