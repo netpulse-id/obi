@@ -99,7 +99,10 @@ int GUARDED_PROG(obi_uprobe_ServeHTTP, struct pt_regs *, ctx) {
     invocation->start_monotime_ns = bpf_ktime_get_ns();
 
     if (req) {
-        server_trace_parent(goroutine_addr, &invocation->tp, decoded_tp);
+        server_trace_parent(goroutine_addr,
+                            &invocation->tp,
+                            decoded_tp,
+                            bpf_map_lookup_elem(&ongoing_server_connections, &g_key));
         // TODO: if context propagation is supported, overwrite the header value in the map with the
         // new span context and the same thread id.
 

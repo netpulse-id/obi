@@ -252,7 +252,8 @@ int GUARDED_PROG(obi_uprobe_server_handleStream, struct pt_regs *, ctx) {
             }
         }
 
-        server_trace_parent(goroutine_addr, &invocation.tp, tp_ptr);
+        grpc_transports_t *transport = st_ptr ? bpf_map_lookup_elem(&ongoing_grpc_transports, &st_ptr) : 0;
+        server_trace_parent(goroutine_addr, &invocation.tp, tp_ptr, transport ? &transport->conn : 0);
     }
 
     if (bpf_map_update_elem(&ongoing_grpc_server_requests, &g_key, &invocation, BPF_ANY)) {

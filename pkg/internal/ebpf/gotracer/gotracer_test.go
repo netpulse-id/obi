@@ -105,6 +105,16 @@ func TestRingbufMetricsConstant(t *testing.T) {
 	assert.Equal(t, true, tracer.constants()["ringbuf_metrics_enabled"])
 }
 
+func TestContextSkipServerPortsConstant(t *testing.T) {
+	cfg := &obi.Config{}
+	cfg.EBPF.ContextPropagationSkipServerPorts = []uint16{9443, 8443, 1, 2, 3, 4, 5, 6, 7}
+	tracer := New(nil, cfg, imetrics.NoopReporter{})
+	assert.Equal(t, [8]uint16{9443, 8443, 1, 2, 3, 4, 5, 6}, tracer.constants()["g_ctx_skip_server_ports"])
+
+	tracer = New(nil, &obi.Config{}, imetrics.NoopReporter{})
+	assert.Equal(t, [8]uint16{}, tracer.constants()["g_ctx_skip_server_ports"])
+}
+
 func TestSetFramerPaddingOffsetUsesExactLayout(t *testing.T) {
 	const symbol = "golang.org/x/net/http2.(*Framer).WriteHeaders"
 	offTable := BpfOffTableT{}

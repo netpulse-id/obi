@@ -96,6 +96,9 @@ type EBPFTracer struct {
 	// Disables OBI black-box context propagation. Used for testing purposes only.
 	DisableBlackBoxCP bool `yaml:"disable_black_box_cp" env:"OTEL_EBPF_BPF_DISABLE_BLACK_BOX_CP" validate:"boolean"`
 
+	// The server ports on which the Go server probes never continue an incoming trace context, at most MaxContextSkipServerPorts.
+	ContextPropagationSkipServerPorts []uint16 `yaml:"context_propagation_skip_server_ports"`
+
 	// Optimizes for getting requests information immediately when request response is seen
 	HighRequestVolume bool `yaml:"high_request_volume" env:"OTEL_EBPF_BPF_HIGH_REQUEST_VOLUME" validate:"boolean"`
 
@@ -325,4 +328,14 @@ func (ContextPropagationMode) JSONSchema() *jsonschema.Schema {
 		Title:       "Context Propagation Mode",
 		Description: "Configures distributed context propagation. Can be 'all' to enable all methods, 'disabled'/'' to disable, or a comma-separated list of methods: 'headers' for HTTP headers, 'tcp' for TCP options (e.g. \"headers,tcp\").",
 	}
+}
+
+// MaxContextSkipServerPorts is how many server ports ContextPropagationSkipServerPorts applies.
+const MaxContextSkipServerPorts = 8
+
+// ContextSkipServerPorts returns the server ports whose incoming trace context is never continued as the probes read them, an unused slot zero.
+func (e *EBPFTracer) ContextSkipServerPorts() [MaxContextSkipServerPorts]uint16 {
+	var out [MaxContextSkipServerPorts]uint16
+	copy(out[:], e.ContextPropagationSkipServerPorts)
+	return out
 }

@@ -477,6 +477,7 @@ func (p *Tracer) constants() map[string]any {
 		"wakeup_data_bytes":              uint32(p.cfg.WakeupLen) * uint32(unsafe.Sizeof(ebpfcommon.HTTPRequestTrace{})),
 		"ringbuf_metrics_enabled":        p.metrics != nil && !imetrics.IsBuiltinNoopReporter(p.metrics),
 		"disable_black_box_cp":           blackBoxCP,
+		"g_ctx_skip_server_ports":        p.cfg.ContextSkipServerPorts(),
 		"attr_type_invalid":              uint64(attribute.INVALID),
 		"attr_type_bool":                 uint64(attribute.BOOL),
 		"attr_type_int64":                uint64(attribute.INT64),

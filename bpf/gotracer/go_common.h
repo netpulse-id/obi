@@ -234,14 +234,38 @@ static __always_inline void tp_clone(tp_info_t *dest, tp_info_t *src) {
     dest->flags = src->flags;
 }
 
-static __always_inline void
-server_trace_parent(void *goroutine_addr, tp_info_t *tp, tp_info_t *found_tp) {
+// The server ports on which an incoming trace context is never continued, zero for an unused slot.
+volatile const u16 g_ctx_skip_server_ports[8];
+
+// ctx_skipped_server reports whether a server connection is on a port whose incoming trace context is never continued.
+static __always_inline u8 ctx_skipped_server(const connection_info_t *conn) {
+    if (!conn) {
+        return 0;
+    }
+    for (int i = 0; i < 8; i++) {
+        const u16 port = g_ctx_skip_server_ports[i];
+        if (port && (conn->s_port == port || conn->d_port == port)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static __always_inline void server_trace_parent(void *goroutine_addr,
+                                                tp_info_t *tp,
+                                                tp_info_t *found_tp,
+                                                const connection_info_t *server_conn) {
     // May get overridden when decoding existing traceparent, but otherwise we set sample ON
     tp->flags = k_flag_sampled;
     tp->ts = bpf_ktime_get_ns();
     go_addr_key_t g_key = {};
     go_addr_key_from_id(&g_key, goroutine_addr);
-    if (found_tp) {
+    const u8 skipped = ctx_skipped_server(server_conn);
+    if (skipped) {
+        bpf_dbg_printk("Server port continues no incoming trace context, generating");
+        urand_bytes(tp->trace_id, TRACE_ID_SIZE_BYTES);
+        *((u64 *)tp->parent_id) = 0;
+    } else if (found_tp) {
         bpf_dbg_printk("Decoded from existing traceparent");
         __builtin_memcpy(tp, found_tp, sizeof(tp_info_t));
     } else {

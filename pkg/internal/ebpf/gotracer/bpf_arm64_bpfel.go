@@ -1122,6 +1122,7 @@ const (
 	BpfVarG_bpfLoopEnabled                                        = "g_bpf_loop_enabled"
 	BpfVarG_bpfProbeWriteUserEnabled                              = "g_bpf_probe_write_user_enabled"
 	BpfVarG_bpfTraceparentEnabled                                 = "g_bpf_traceparent_enabled"
+	BpfVarG_ctxSkipServerPorts                                    = "g_ctx_skip_server_ports"
 	BpfVarG_goH2WriteFailStep                                     = "g_go_h2_write_fail_step"
 	BpfVarG_tracesCtxV1Enabled                                    = "g_traces_ctx_v1_enabled"
 	BpfVarHighRequestVolume                                       = "high_request_volume"
@@ -1507,6 +1508,7 @@ type BpfVariableSpecs struct {
 	G_bpfLoopEnabled           *ebpf.VariableSpec `ebpf:"g_bpf_loop_enabled"`
 	G_bpfProbeWriteUserEnabled *ebpf.VariableSpec `ebpf:"g_bpf_probe_write_user_enabled"`
 	G_bpfTraceparentEnabled    *ebpf.VariableSpec `ebpf:"g_bpf_traceparent_enabled"`
+	G_ctxSkipServerPorts       *ebpf.VariableSpec `ebpf:"g_ctx_skip_server_ports"`
 	G_goH2WriteFailStep        *ebpf.VariableSpec `ebpf:"g_go_h2_write_fail_step"`
 	G_tracesCtxV1Enabled       *ebpf.VariableSpec `ebpf:"g_traces_ctx_v1_enabled"`
 	HighRequestVolume          *ebpf.VariableSpec `ebpf:"high_request_volume"`
@@ -1864,6 +1866,7 @@ type BpfVariables struct {
 	G_bpfLoopEnabled           *ebpf.Variable `ebpf:"g_bpf_loop_enabled"`
 	G_bpfProbeWriteUserEnabled *ebpf.Variable `ebpf:"g_bpf_probe_write_user_enabled"`
 	G_bpfTraceparentEnabled    *ebpf.Variable `ebpf:"g_bpf_traceparent_enabled"`
+	G_ctxSkipServerPorts       *ebpf.Variable `ebpf:"g_ctx_skip_server_ports"`
 	G_goH2WriteFailStep        *ebpf.Variable `ebpf:"g_go_h2_write_fail_step"`
 	G_tracesCtxV1Enabled       *ebpf.Variable `ebpf:"g_traces_ctx_v1_enabled"`
 	HighRequestVolume          *ebpf.Variable `ebpf:"high_request_volume"`
