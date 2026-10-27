@@ -322,6 +322,7 @@ func generateTracesWithAttributes(
 		}
 		s.SetEndTimestamp(pcommon.NewTimestampFromTime(t.End))
 	}
+	SanitizeTraces(traces)
 	return traces
 }
 
