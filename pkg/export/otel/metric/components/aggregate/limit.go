@@ -26,17 +26,44 @@ func newLimiter[V any](aggregation int) limiter[V] {
 	return limiter[V]{aggLimit: aggregation}
 }
 
+// overflowKept names the attributes an overflow stream keeps from the measurement
+// it takes, so the requests folded past the limit stay apart by method and outcome
+// and their errors are still counted as errors.
+var overflowKept = []attribute.Key{
+	"http.request.method",
+	"http.response.status_code",
+	"rpc.response.status_code",
+	"rpc.grpc.status_code",
+	"db.response.status_code",
+	"error.type",
+}
+
 // Attributes checks if adding a measurement for attrs will exceed the
 // aggregation cardinality limit for the existing measurements. If it will,
-// overflowSet is returned. Otherwise, if it will not exceed the limit, or the
-// limit is not set (limit <= 0), attr is returned.
+// the overflow set of attrs is returned. Otherwise, if it will not exceed the
+// limit, or the limit is not set (limit <= 0), attr is returned.
 func (l limiter[V]) Attributes(attrs attribute.Set, measurements map[attribute.Distinct]V) attribute.Set {
 	if l.aggLimit > 0 {
 		_, exists := measurements[attrs.Equivalent()]
 		if !exists && len(measurements) >= l.aggLimit-1 {
-			return overflowSet
+			return overflowAttributes(attrs)
 		}
 	}
 
 	return attrs
+}
+
+// overflowAttributes returns the overflow set of a measurement: the
+// "otel.metric.overflow"=true attribute and the overflowKept attributes it carries.
+func overflowAttributes(attrs attribute.Set) attribute.Set {
+	kept := []attribute.KeyValue{overflowSet.ToSlice()[0]}
+	for _, k := range overflowKept {
+		if v, ok := attrs.Value(k); ok {
+			kept = append(kept, attribute.KeyValue{Key: k, Value: v})
+		}
+	}
+	if len(kept) == 1 {
+		return overflowSet
+	}
+	return attribute.NewSet(kept...)
 }
