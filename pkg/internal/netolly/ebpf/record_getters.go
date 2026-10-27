@@ -148,17 +148,17 @@ func (r recordGetters) get(name attr.Name) (attributes.Getter[*Record, attribute
 }
 
 // publicClientEnd returns what an end of a flow is reported as when the sensor saw that end
-// open the connection and it is a public address, false otherwise; a flow whose opening was
-// not seen keeps both its ends.
+// open the connection, it is a remote public address and the other end is private or the
+// host's own, false otherwise; a flow whose opening was not seen keeps both its ends.
 func publicClientEnd(r *Record, end uint8) (string, bool) {
 	if r.Metrics.Initiator != end {
 		return "", false
 	}
-	addr := &r.CommonAttrs.SrcAddr
+	client, server := &r.CommonAttrs.SrcAddr, &r.CommonAttrs.DstAddr
 	if end == InitiatorDst {
-		addr = &r.CommonAttrs.DstAddr
+		client, server = server, client
 	}
-	return pipe.PublicClient(addr, r.CommonAttrs.OBIIP)
+	return pipe.PublicClient(client, server, r.CommonAttrs.OBIIP)
 }
 
 func RecordStringGetters(

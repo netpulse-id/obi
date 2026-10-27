@@ -28,26 +28,29 @@ func TestStatGetters_APublicClientOfAServerSocketIsCollapsed(t *testing.T) {
 		return &Stat{
 			Type:                    StatTypeTCPSuccessfulConnection,
 			TCPSuccessfulConnection: &TCPSuccessfulConnection{Role: uint8(role)},
-			CommonAttrs:             pipe.CommonAttrs{SrcAddr: ip(local), DstAddr: ip(remote), OBIIP: "198.51.100.9"},
+			CommonAttrs:             pipe.CommonAttrs{SrcAddr: ip(local), DstAddr: ip(remote), OBIIP: "9.9.9.9"},
 		}
 	}
 
-	server := stat("10.0.0.5", "203.0.113.7", CodeRoleServer)
+	server := stat("10.0.0.5", "8.8.4.4", CodeRoleServer)
 	assert.Equal(t, pipe.PublicClientsV4, dst(server).Value.AsString())
 	assert.Equal(t, "10.0.0.5", src(server).Value.AsString())
 
-	client := stat("10.0.0.5", "203.0.113.7", CodeRoleClient)
-	assert.Equal(t, "203.0.113.7", dst(client).Value.AsString(), "a public server a socket dialed keeps its address")
+	client := stat("10.0.0.5", "8.8.4.4", CodeRoleClient)
+	assert.Equal(t, "8.8.4.4", dst(client).Value.AsString(), "a public server a socket dialed keeps its address")
 
 	private := stat("10.0.0.5", "10.0.0.6", CodeRoleServer)
 	assert.Equal(t, "10.0.0.6", dst(private).Value.AsString())
 
-	v6 := stat("fd00::5", "2001:db8::7", CodeRoleServer)
+	v6 := stat("fd00::5", "2606:4700::7", CodeRoleServer)
 	assert.Equal(t, pipe.PublicClientsV6, dst(v6).Value.AsString())
 
-	rtt := &Stat{Type: StatTypeTCPRtt, TCPRtt: &TCPRtt{Role: uint8(CodeRoleServer)}, CommonAttrs: pipe.CommonAttrs{SrcAddr: ip("10.0.0.5"), DstAddr: ip("203.0.113.7")}}
+	rtt := &Stat{Type: StatTypeTCPRtt, TCPRtt: &TCPRtt{Role: uint8(CodeRoleServer)}, CommonAttrs: pipe.CommonAttrs{SrcAddr: ip("10.0.0.5"), DstAddr: ip("8.8.4.4")}}
 	assert.Equal(t, pipe.PublicClientsV4, dst(rtt).Value.AsString())
 
-	retransmit := &Stat{Type: StatTypeTCPRetransmit, TCPRetransmit: true, CommonAttrs: pipe.CommonAttrs{SrcAddr: ip("10.0.0.5"), DstAddr: ip("203.0.113.7")}}
-	assert.Equal(t, "203.0.113.7", dst(retransmit).Value.AsString(), "a stat without a role keeps its ends")
+	pod := stat("2600:1f18:4a3:6b00::13", "2600:1f18:4a3:6b00::12", CodeRoleServer)
+	assert.Equal(t, "2600:1f18:4a3:6b00::12", dst(pod).Value.AsString(), "a calling pod with a global address keeps it")
+
+	retransmit := &Stat{Type: StatTypeTCPRetransmit, TCPRetransmit: true, CommonAttrs: pipe.CommonAttrs{SrcAddr: ip("10.0.0.5"), DstAddr: ip("8.8.4.4")}}
+	assert.Equal(t, "8.8.4.4", dst(retransmit).Value.AsString(), "a stat without a role keeps its ends")
 }

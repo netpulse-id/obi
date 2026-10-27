@@ -134,10 +134,11 @@ func statRole(s *Stat) uint8 {
 }
 
 // publicClientEnd returns what the destination of a stat read at the server's socket is
-// reported as when that client end is a public address, false otherwise.
+// reported as when that client end is a remote public address calling a private or host
+// address, false otherwise.
 func publicClientEnd(s *Stat) (string, bool) {
 	if NetworkTCPHandshakeRoleCode(statRole(s)) != CodeRoleServer {
 		return "", false
 	}
-	return pipe.PublicClient(&s.CommonAttrs.DstAddr, s.CommonAttrs.OBIIP)
+	return pipe.PublicClient(&s.CommonAttrs.DstAddr, &s.CommonAttrs.SrcAddr, s.CommonAttrs.OBIIP)
 }
