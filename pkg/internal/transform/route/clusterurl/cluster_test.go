@@ -4,6 +4,7 @@
 package clusterurl
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -128,7 +129,7 @@ func BenchmarkClusterURLWithoutCache(b *testing.B) {
 	}
 }
 
-func TestClusterURLKeepsShortAndDotLedWords(t *testing.T) {
+func TestClusterURLKeepsShortWordsAndWellKnown(t *testing.T) {
 	csf, err := NewClusterURLClassifier(DefaultConfig())
 	require.NoError(t, err)
 	for path, want := range map[string]string{
@@ -147,9 +148,14 @@ func TestClusterURLKeepsShortAndDotLedWords(t *testing.T) {
 		"/files/README.md":                            "/files/*",
 		"/files/some-file.txt":                        "/files/*",
 		// A letters-only identifier of at most four letters reads as a word.
-		"/codes/xkqz": "/codes/xkqz",
-		"/x/.":        "/x/*",
-		"/x/..":       "/x/*",
+		"/codes/xkqz":       "/codes/xkqz",
+		"/x/.":              "/x/*",
+		"/x/..":             "/x/*",
+		"/.env":             "/*",
+		"/.git/HEAD":        "/*/HEAD",
+		"/.aws/credentials": "/*/credentials",
+		// A segment longer than 64 bytes is an identifier even when its parts are short words.
+		"/x/" + strings.Repeat("ab-", 23) + "a": "/x/*",
 	} {
 		assert.Equal(t, want, csf.ClusterURL(path), path)
 	}
