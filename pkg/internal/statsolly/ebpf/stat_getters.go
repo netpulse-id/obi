@@ -8,6 +8,7 @@ import (
 
 	"go.opentelemetry.io/obi/pkg/export/attributes"
 	attr "go.opentelemetry.io/obi/pkg/export/attributes/names"
+	"go.opentelemetry.io/obi/pkg/internal/pipe"
 )
 
 // StatGetters returns the attributes.Getter function that returns the string value of a given
@@ -25,6 +26,9 @@ func StatGetters(name attr.Name) (attributes.Getter[*Stat, attribute.KeyValue], 
 		}
 	case attr.DstAddress:
 		getter = func(s *Stat) attribute.KeyValue {
+			if client, ok := publicClientEnd(s); ok {
+				return attribute.String(string(attr.DstAddress), client)
+			}
 			return attribute.String(string(attr.DstAddress), s.CommonAttrs.DstAddr.IP().String())
 		}
 	case attr.SrcPort:
@@ -52,16 +56,7 @@ func StatGetters(name attr.Name) (attributes.Getter[*Stat, attribute.KeyValue], 
 		}
 	case attr.NetworkTCPHandshakeRole:
 		getter = func(s *Stat) attribute.KeyValue {
-			var role uint8
-			switch s.Type {
-			case StatTypeTCPFailedConnection:
-				role = s.TCPFailedConnection.Role
-			case StatTypeTCPRtt:
-				role = s.TCPRtt.Role
-			case StatTypeTCPSuccessfulConnection:
-				role = s.TCPSuccessfulConnection.Role
-			}
-			return attribute.String(string(attr.NetworkTCPHandshakeRole), networkTCPHandshakeRoleStr(role))
+			return attribute.String(string(attr.NetworkTCPHandshakeRole), networkTCPHandshakeRoleStr(statRole(s)))
 		}
 	case attr.NetworkIoDirection:
 		getter = func(s *Stat) attribute.KeyValue {
@@ -123,4 +118,26 @@ func networkIoDirectionStr(d NetworkIoDirectionCode) string {
 		return string(DirectionReceive)
 	}
 	return ""
+}
+
+// statRole returns the handshake role of the socket a stat was read at, unknown for a stat that carries none.
+func statRole(s *Stat) uint8 {
+	switch {
+	case s.Type == StatTypeTCPFailedConnection && s.TCPFailedConnection != nil:
+		return s.TCPFailedConnection.Role
+	case s.Type == StatTypeTCPRtt && s.TCPRtt != nil:
+		return s.TCPRtt.Role
+	case s.Type == StatTypeTCPSuccessfulConnection && s.TCPSuccessfulConnection != nil:
+		return s.TCPSuccessfulConnection.Role
+	}
+	return uint8(CodeRoleUnknown)
+}
+
+// publicClientEnd returns what the destination of a stat read at the server's socket is
+// reported as when that client end is a public address, false otherwise.
+func publicClientEnd(s *Stat) (string, bool) {
+	if NetworkTCPHandshakeRoleCode(statRole(s)) != CodeRoleServer {
+		return "", false
+	}
+	return pipe.PublicClient(&s.CommonAttrs.DstAddr, s.CommonAttrs.OBIIP)
 }

@@ -9,6 +9,7 @@ import (
 	"go.opentelemetry.io/obi/pkg/export/attributes"
 	attr "go.opentelemetry.io/obi/pkg/export/attributes/names"
 	"go.opentelemetry.io/obi/pkg/internal/netolly/flow/transport"
+	"go.opentelemetry.io/obi/pkg/internal/pipe"
 	"go.opentelemetry.io/obi/pkg/netolly/flowdef"
 )
 
@@ -55,10 +56,16 @@ func (r recordGetters) get(name attr.Name) (attributes.Getter[*Record, attribute
 		}
 	case attr.SrcAddress:
 		getter = func(r *Record) attribute.KeyValue {
+			if client, ok := publicClientEnd(r, InitiatorSrc); ok {
+				return attribute.String(string(attr.SrcAddress), client)
+			}
 			return attribute.String(string(attr.SrcAddress), r.CommonAttrs.SrcAddr.IP().String())
 		}
 	case attr.DstAddress:
 		getter = func(r *Record) attribute.KeyValue {
+			if client, ok := publicClientEnd(r, InitiatorDst); ok {
+				return attribute.String(string(attr.DstAddress), client)
+			}
 			return attribute.String(string(attr.DstAddress), r.CommonAttrs.DstAddr.IP().String())
 		}
 	case attr.SrcPort:
@@ -71,10 +78,16 @@ func (r recordGetters) get(name attr.Name) (attributes.Getter[*Record, attribute
 		}
 	case attr.SrcName:
 		getter = func(r *Record) attribute.KeyValue {
+			if client, ok := publicClientEnd(r, InitiatorSrc); ok {
+				return attribute.String(string(attr.SrcName), client)
+			}
 			return attribute.String(string(attr.SrcName), r.CommonAttrs.SrcName)
 		}
 	case attr.DstName:
 		getter = func(r *Record) attribute.KeyValue {
+			if client, ok := publicClientEnd(r, InitiatorDst); ok {
+				return attribute.String(string(attr.DstName), client)
+			}
 			return attribute.String(string(attr.DstName), r.CommonAttrs.DstName)
 		}
 	case attr.IfaceDirection:
@@ -132,6 +145,20 @@ func (r recordGetters) get(name attr.Name) (attributes.Getter[*Record, attribute
 		}
 	}
 	return getter, getter != nil
+}
+
+// publicClientEnd returns what an end of a flow is reported as when the sensor saw that end
+// open the connection and it is a public address, false otherwise; a flow whose opening was
+// not seen keeps both its ends.
+func publicClientEnd(r *Record, end uint8) (string, bool) {
+	if r.Metrics.Initiator != end {
+		return "", false
+	}
+	addr := &r.CommonAttrs.SrcAddr
+	if end == InitiatorDst {
+		addr = &r.CommonAttrs.DstAddr
+	}
+	return pipe.PublicClient(addr, r.CommonAttrs.OBIIP)
 }
 
 func RecordStringGetters(
