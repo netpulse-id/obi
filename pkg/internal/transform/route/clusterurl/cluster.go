@@ -89,11 +89,17 @@ func (csf *ClusterURLClassifier) ClusterURL(path string) string {
 				p[sPos] = csf.cfg.ReplaceWith
 				sPos++
 			} else if !skip && sFwd > sPos {
-				// preserve chars
-				sPos = sFwd
+				// judge the segment the delimiter ends like one a separator ends
+				if !csf.okWord(string(p[sPos:sFwd])) {
+					p[sPos] = csf.cfg.ReplaceWith
+					sPos++
+				} else {
+					sPos = sFwd
+				}
 			}
 
 			p = p[:sPos]
+			sFwd = sPos
 			break
 		}
 
