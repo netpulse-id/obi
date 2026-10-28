@@ -12,40 +12,60 @@ import (
 )
 
 const (
-	// kafkaTopicNamesPerProcess bounds the topic names one process holds.
-	kafkaTopicNamesPerProcess = 512
-	// kafkaTopicNamesIdle is how long a process that neither names nor resolves a topic
-	// keeps its names: longer than a client's Metadata refresh (5 minutes by default), so a
-	// live consumer keeps them, and a process that exited loses them.
+	// kafkaTopicNamesPerNamespace bounds the topic names the processes of one pid
+	// namespace (a container or a pod) hold together.
+	kafkaTopicNamesPerNamespace = 512
+	// kafkaTopicNamesIdle is how long a pid namespace none of whose processes names or
+	// resolves a topic keeps its names: longer than a client's Metadata refresh (5 minutes
+	// by default), so live consumers keep them, and a namespace that went quiet loses them.
 	kafkaTopicNamesIdle = 15 * time.Minute
 )
 
-// KafkaTopicNames holds the KIP-516 topic names each process's own Metadata responses
-// gave. Every process has its own share of at most kafkaTopicNamesPerProcess names, its
-// least recently used leaving first; past the total, the process holding the most loses
-// its least recently used name, so one process's responses never evict another's names
-// while it holds no more than they do. A process idle past kafkaTopicNamesIdle is forgotten.
-type KafkaTopicNames struct {
-	total      int
-	perProcess int
-	size       int
-	procs      map[KafkaProcess]*processTopicNames
-	now        func() time.Time
-	sweptAt    time.Time
+// processTopic keys a name by the process whose own Metadata response gave it, within its
+// pid namespace, so a process resolves only the names its own responses gave.
+type processTopic struct {
+	pid  uint32
+	uuid kafkaparser.UUID
 }
 
-type processTopicNames struct {
-	names *simplelru.LRU[kafkaparser.UUID, string]
+type namespaceTopicNames struct {
+	ns    uint32
+	names *simplelru.LRU[processTopic, string]
 	seen  time.Time
+}
+
+// KafkaTopicNames holds the KIP-516 topic names each process's own Metadata responses
+// gave. The processes of one pid namespace share at most kafkaTopicNamesPerNamespace
+// names, their least recently used leaving first, so however many processes a container
+// runs it holds no more than one share. Past the host total the namespace holding the most
+// loses its least recently used name, found through namespaces indexed by how many names
+// they hold, never by scanning them. A namespace idle past kafkaTopicNamesIdle is forgotten.
+type KafkaTopicNames struct {
+	total        int
+	perNamespace int
+	size         int
+	spaces       map[uint32]*namespaceTopicNames
+	// bySize indexes the namespaces by how many names each holds; most is the largest
+	// count any namespace may hold, the busiest found by walking down from it.
+	bySize  []map[uint32]struct{}
+	most    int
+	now     func() time.Time
+	sweptAt time.Time
 }
 
 // NewKafkaTopicNames returns names bounded by total on the host.
 func NewKafkaTopicNames(total int) *KafkaTopicNames {
+	per := min(kafkaTopicNamesPerNamespace, max(total, 1))
+	bySize := make([]map[uint32]struct{}, per+1)
+	for i := range bySize {
+		bySize[i] = map[uint32]struct{}{}
+	}
 	return &KafkaTopicNames{
-		total:      total,
-		perProcess: min(kafkaTopicNamesPerProcess, total),
-		procs:      map[KafkaProcess]*processTopicNames{},
-		now:        time.Now,
+		total:        total,
+		perNamespace: per,
+		spaces:       map[uint32]*namespaceTopicNames{},
+		bySize:       bySize,
+		now:          time.Now,
 	}
 }
 
@@ -56,27 +76,35 @@ func (n *KafkaTopicNames) Add(proc KafkaProcess, uuid kafkaparser.UUID, name str
 	}
 	now := n.now()
 	n.sweep(now)
-	p := n.procs[proc]
-	if p == nil {
-		names, _ := simplelru.NewLRU[kafkaparser.UUID, string](n.perProcess, nil)
-		p = &processTopicNames{names: names}
-		n.procs[proc] = p
+	key := processTopic{pid: proc.Pid, uuid: uuid}
+	s := n.spaces[proc.Ns]
+	if s == nil {
+		names, _ := simplelru.NewLRU[processTopic, string](n.perNamespace, nil)
+		s = &namespaceTopicNames{ns: proc.Ns, names: names}
+		n.spaces[proc.Ns] = s
+		n.bySize[0][proc.Ns] = struct{}{}
 	}
-	p.seen = now
-	if p.names.Contains(uuid) {
-		p.names.Add(uuid, name)
+	s.seen = now
+	if s.names.Contains(key) {
+		s.names.Add(key, name)
 		return
 	}
 	switch {
-	case p.names.Len() >= n.perProcess:
-		p.names.RemoveOldest()
-		n.size--
+	case s.names.Len() >= n.perNamespace:
+		n.dropOldest(s)
 	case n.size >= n.total:
-		n.dropFromBusiest()
+		if busiest := n.busiest(); busiest != nil {
+			n.dropOldest(busiest)
+		}
 	}
-	n.procs[proc] = p
-	p.names.Add(uuid, name)
+	if n.spaces[proc.Ns] == nil {
+		n.spaces[proc.Ns] = s
+		n.bySize[s.names.Len()][proc.Ns] = struct{}{}
+	}
+	before := s.names.Len()
+	s.names.Add(key, name)
 	n.size++
+	n.resized(s, before)
 }
 
 // Get returns the name a process's own Metadata responses gave a topic id.
@@ -84,12 +112,12 @@ func (n *KafkaTopicNames) Get(proc KafkaProcess, uuid kafkaparser.UUID) (string,
 	if n == nil {
 		return "", false
 	}
-	p := n.procs[proc]
-	if p == nil {
+	s := n.spaces[proc.Ns]
+	if s == nil {
 		return "", false
 	}
-	p.seen = n.now()
-	return p.names.Get(uuid)
+	s.seen = n.now()
+	return s.names.Get(processTopic{pid: proc.Pid, uuid: uuid})
 }
 
 // Len returns how many names are held on the host.
@@ -100,36 +128,53 @@ func (n *KafkaTopicNames) Len() int {
 	return n.size
 }
 
-// dropFromBusiest removes the least recently used name of the process holding the most.
-func (n *KafkaTopicNames) dropFromBusiest() {
-	var busiest KafkaProcess
-	var most *processTopicNames
-	for proc, p := range n.procs {
-		if most == nil || p.names.Len() > most.names.Len() {
-			busiest, most = proc, p
-		}
+// busiest returns the namespace holding the most names, nil for none.
+func (n *KafkaTopicNames) busiest() *namespaceTopicNames {
+	for n.most > 0 && len(n.bySize[n.most]) == 0 {
+		n.most--
 	}
-	if most == nil {
+	for ns := range n.bySize[n.most] {
+		return n.spaces[ns]
+	}
+	return nil
+}
+
+// dropOldest removes a namespace's least recently used name, and the namespace once it holds none.
+func (n *KafkaTopicNames) dropOldest(s *namespaceTopicNames) {
+	before := s.names.Len()
+	if _, _, ok := s.names.RemoveOldest(); !ok {
 		return
 	}
-	if _, _, ok := most.names.RemoveOldest(); ok {
-		n.size--
-	}
-	if most.names.Len() == 0 {
-		delete(n.procs, busiest)
+	n.size--
+	n.resized(s, before)
+	if s.names.Len() == 0 {
+		delete(n.bySize[0], s.ns)
+		delete(n.spaces, s.ns)
 	}
 }
 
-// sweep forgets every process idle past kafkaTopicNamesIdle, at most once a minute.
+// resized moves a namespace in the size index after its count changed from before.
+func (n *KafkaTopicNames) resized(s *namespaceTopicNames, before int) {
+	after := s.names.Len()
+	if after == before {
+		return
+	}
+	delete(n.bySize[before], s.ns)
+	n.bySize[after][s.ns] = struct{}{}
+	n.most = max(n.most, after)
+}
+
+// sweep forgets every namespace idle past kafkaTopicNamesIdle, at most once a minute.
 func (n *KafkaTopicNames) sweep(now time.Time) {
 	if now.Sub(n.sweptAt) < time.Minute {
 		return
 	}
 	n.sweptAt = now
-	for proc, p := range n.procs {
-		if now.Sub(p.seen) >= kafkaTopicNamesIdle {
-			n.size -= p.names.Len()
-			delete(n.procs, proc)
+	for ns, s := range n.spaces {
+		if now.Sub(s.seen) >= kafkaTopicNamesIdle {
+			n.size -= s.names.Len()
+			delete(n.bySize[s.names.Len()], ns)
+			delete(n.spaces, ns)
 		}
 	}
 }
