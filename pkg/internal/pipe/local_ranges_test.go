@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -80,4 +81,19 @@ func TestParseLocalRanges_Bounded(t *testing.T) {
 	assert.False(t, set.ipv6Whole, "lines past the bound are not read")
 	assert.True(t, set.contains(net.ParseIP("10.1.2.3")))
 	assert.True(t, parseLocalRanges(strings.NewReader("::ffff:10.0.0.1\n")).contains(net.ParseIP("10.0.0.1")))
+}
+
+func TestReadLocalRanges_NoLinkNoPipe(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real")
+	require.NoError(t, os.WriteFile(real, []byte("10.0.0.0/8\n"), 0o600))
+	link := filepath.Join(dir, "link")
+	require.NoError(t, os.Symlink(real, link))
+	fifo := filepath.Join(dir, "fifo")
+	require.NoError(t, syscall.Mkfifo(fifo, 0o600))
+
+	assert.True(t, readLocalRanges(real).contains(net.ParseIP("10.1.2.3")))
+	assert.False(t, readLocalRanges(link).contains(net.ParseIP("10.1.2.3")), "a link is not followed")
+	assert.False(t, readLocalRanges(fifo).contains(net.ParseIP("10.1.2.3")), "a pipe is not waited on")
+	assert.False(t, readLocalRanges(dir).contains(net.ParseIP("10.1.2.3")), "a directory is no file")
 }

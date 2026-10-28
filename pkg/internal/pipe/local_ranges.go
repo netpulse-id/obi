@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -91,14 +92,22 @@ func currentLocalRanges(now time.Time) localRangeSet {
 		return localRanges.set
 	}
 	localRanges.read = now
-	f, err := os.Open(localRanges.path)
+	localRanges.set = readLocalRanges(localRanges.path)
+	return localRanges.set
+}
+
+// readLocalRanges reads the local ranges file without following a link or waiting on a pipe; a
+// file that cannot be opened or is no regular file leaves no range.
+func readLocalRanges(path string) localRangeSet {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		localRanges.set = localRangeSet{}
-		return localRanges.set
+		return localRangeSet{}
 	}
 	defer f.Close()
-	localRanges.set = parseLocalRanges(io.LimitReader(f, maxLocalRangesBytes))
-	return localRanges.set
+	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
+		return localRangeSet{}
+	}
+	return parseLocalRanges(io.LimitReader(f, maxLocalRangesBytes))
 }
 
 // parseLocalRanges reads one prefix or address per line, at most maxLocalRanges, and the line
