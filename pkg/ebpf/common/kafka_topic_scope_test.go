@@ -7,7 +7,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hashicorp/golang-lru/v2/simplelru"
 	"github.com/stretchr/testify/require"
 
 	"go.opentelemetry.io/obi/pkg/internal/largebuf"
@@ -47,7 +46,7 @@ var scopeFetch = []byte{
 	1,
 }
 
-func fetchedTopic(t *testing.T, cache *simplelru.LRU[KafkaTopicKey, string], proc KafkaProcess, conn BpfConnectionInfoT) string {
+func fetchedTopic(t *testing.T, cache *KafkaTopicNames, proc KafkaProcess, conn BpfConnectionInfoT) string {
 	t.Helper()
 	res, _, err := ProcessKafkaEvent(largebuf.NewLargeBufferFrom(scopeFetch), nil, cache, nil, proc, conn)
 	require.NoError(t, err)
@@ -55,7 +54,7 @@ func fetchedTopic(t *testing.T, cache *simplelru.LRU[KafkaTopicKey, string], pro
 	return res[0].Topic
 }
 
-func learnMetadata(t *testing.T, cache *simplelru.LRU[KafkaTopicKey, string], name string, proc KafkaProcess, conn BpfConnectionInfoT) {
+func learnMetadata(t *testing.T, cache *KafkaTopicNames, name string, proc KafkaProcess, conn BpfConnectionInfoT) {
 	t.Helper()
 	_, _, err := ProcessKafkaEvent(largebuf.NewLargeBufferFrom(scopeMetadataReq), largebuf.NewLargeBufferFrom(scopeMetadataResp(name)), cache, nil, proc, conn)
 	require.NoError(t, err)
@@ -66,7 +65,7 @@ func TestKafkaTopicNames_AnotherProcessesMetadataRenamesNothing(t *testing.T) {
 	victim, attacker := KafkaProcess{Ns: 1, Pid: 100}, KafkaProcess{Ns: 2, Pid: 200}
 	victimConn := BpfConnectionInfoT{S_port: 40000, D_port: 9092}
 	attackerConn := BpfConnectionInfoT{S_port: 40001, D_port: 19092}
-	cache, _ := simplelru.NewLRU[KafkaTopicKey, string](1024, nil)
+	cache := NewKafkaTopicNames(1024)
 
 	learnMetadata(t, cache, "topic1", victim, victimConn)
 	learnMetadata(t, cache, "evil-x", attacker, attackerConn)
@@ -80,7 +79,7 @@ func TestKafkaTopicNames_AnotherProcessesMetadataRenamesNothing(t *testing.T) {
 func TestKafkaTopicNames_ANameLongerThanKafkaAcceptsNamesNothing(t *testing.T) {
 	proc := KafkaProcess{Ns: 1, Pid: 100}
 	conn := BpfConnectionInfoT{S_port: 40000, D_port: 9092}
-	cache, _ := simplelru.NewLRU[KafkaTopicKey, string](1024, nil)
+	cache := NewKafkaTopicNames(1024)
 
 	_, _, _ = ProcessKafkaEvent(largebuf.NewLargeBufferFrom(scopeMetadataReq), largebuf.NewLargeBufferFrom(scopeMetadataResp(strings.Repeat("t", 250))), cache, nil, proc, conn)
 	require.Zero(t, cache.Len())

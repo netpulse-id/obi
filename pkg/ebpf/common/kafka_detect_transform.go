@@ -7,8 +7,6 @@ import (
 	"errors"
 	"unsafe"
 
-	"github.com/hashicorp/golang-lru/v2/simplelru"
-
 	"go.opentelemetry.io/obi/pkg/appolly/app"
 	"go.opentelemetry.io/obi/pkg/appolly/app/request"
 	"go.opentelemetry.io/obi/pkg/internal/ebpf/kafkaparser"
@@ -60,7 +58,7 @@ func (k Operation) String() string {
 // ProcessPossibleKafkaEvent processes a TCP packet and returns error if the packet is not a valid Kafka request.
 // Otherwise, it returns one KafkaInfo per topic in the request (a single Produce/Fetch request can
 // reference multiple topics).
-func ProcessPossibleKafkaEvent(event *TCPRequestInfo, pkt *largebuf.LargeBuffer, rpkt *largebuf.LargeBuffer, kafkaTopicUUIDToName *simplelru.LRU[KafkaTopicKey, string], groups *KafkaConsumerGroups) ([]*KafkaInfo, bool, error) {
+func ProcessPossibleKafkaEvent(event *TCPRequestInfo, pkt *largebuf.LargeBuffer, rpkt *largebuf.LargeBuffer, kafkaTopicUUIDToName *KafkaTopicNames, groups *KafkaConsumerGroups) ([]*KafkaInfo, bool, error) {
 	proc := KafkaProcess{Ns: event.Pid.Ns, Pid: event.Pid.UserPid}
 	k, ok, err := ProcessKafkaEvent(pkt, rpkt, kafkaTopicUUIDToName, clientGroups(groups, event.Direction), proc, event.ConnInfo)
 	if err != nil {
@@ -84,7 +82,7 @@ func clientGroups(groups *KafkaConsumerGroups, direction uint8) *KafkaConsumerGr
 	return groups
 }
 
-func ProcessKafkaEvent(pkt *largebuf.LargeBuffer, rpkt *largebuf.LargeBuffer, kafkaTopicUUIDToName *simplelru.LRU[KafkaTopicKey, string], groups *KafkaConsumerGroups, proc KafkaProcess, conn BpfConnectionInfoT) ([]*KafkaInfo, bool, error) {
+func ProcessKafkaEvent(pkt *largebuf.LargeBuffer, rpkt *largebuf.LargeBuffer, kafkaTopicUUIDToName *KafkaTopicNames, groups *KafkaConsumerGroups, proc KafkaProcess, conn BpfConnectionInfoT) ([]*KafkaInfo, bool, error) {
 	hdr, err := kafkaparser.NewKafkaRequestHeader(pkt)
 	if err != nil {
 		return nil, true, err
@@ -107,7 +105,7 @@ func ProcessKafkaEvent(pkt *largebuf.LargeBuffer, rpkt *largebuf.LargeBuffer, ka
 
 // processGroupRequest updates the consumer group membership of the requesting process.
 // Like Metadata, these requests never produce a span.
-func processGroupRequest(hdr kafkaparser.KafkaRequestHeader, kafkaTopicUUIDToName *simplelru.LRU[KafkaTopicKey, string], groups *KafkaConsumerGroups, proc KafkaProcess, conn BpfConnectionInfoT) ([]*KafkaInfo, bool, error) {
+func processGroupRequest(hdr kafkaparser.KafkaRequestHeader, kafkaTopicUUIDToName *KafkaTopicNames, groups *KafkaConsumerGroups, proc KafkaProcess, conn BpfConnectionInfoT) ([]*KafkaInfo, bool, error) {
 	r, err := hdr.NewBodyReader()
 	if err != nil {
 		return nil, true, err
@@ -135,28 +133,20 @@ func processGroupRequest(hdr kafkaparser.KafkaRequestHeader, kafkaTopicUUIDToNam
 	return nil, true, nil
 }
 
-// KafkaTopicKey scopes a KIP-516 topic UUID to the process whose Metadata responses
-// named it: a process resolves only the names its own responses gave, so one process
-// can never rename the topics another one fetches.
-type KafkaTopicKey struct {
-	Proc KafkaProcess
-	UUID kafkaparser.UUID
-}
-
 // resolveTopicName returns the topic name, resolving a KIP-516 UUID through the names
 // the process' own Metadata responses gave; "" when the UUID is not known yet.
-func resolveTopicName(name string, uuid *kafkaparser.UUID, kafkaTopicUUIDToName *simplelru.LRU[KafkaTopicKey, string], proc KafkaProcess) string {
+func resolveTopicName(name string, uuid *kafkaparser.UUID, kafkaTopicUUIDToName *KafkaTopicNames, proc KafkaProcess) string {
 	if uuid == nil {
 		return name
 	}
 	if kafkaTopicUUIDToName == nil {
 		return ""
 	}
-	resolved, _ := kafkaTopicUUIDToName.Get(KafkaTopicKey{Proc: proc, UUID: *uuid})
+	resolved, _ := kafkaTopicUUIDToName.Get(proc, *uuid)
 	return resolved
 }
 
-func processProduceRequest(hdr kafkaparser.KafkaRequestHeader, kafkaTopicUUIDToName *simplelru.LRU[KafkaTopicKey, string], proc KafkaProcess) ([]*KafkaInfo, bool, error) {
+func processProduceRequest(hdr kafkaparser.KafkaRequestHeader, kafkaTopicUUIDToName *KafkaTopicNames, proc KafkaProcess) ([]*KafkaInfo, bool, error) {
 	r, err := hdr.NewBodyReader()
 	if err != nil {
 		return nil, true, err
@@ -189,7 +179,7 @@ func processProduceRequest(hdr kafkaparser.KafkaRequestHeader, kafkaTopicUUIDToN
 	return infos, false, nil
 }
 
-func processFetchRequest(hdr kafkaparser.KafkaRequestHeader, kafkaTopicUUIDToName *simplelru.LRU[KafkaTopicKey, string], groups *KafkaConsumerGroups, proc KafkaProcess) ([]*KafkaInfo, bool, error) {
+func processFetchRequest(hdr kafkaparser.KafkaRequestHeader, kafkaTopicUUIDToName *KafkaTopicNames, groups *KafkaConsumerGroups, proc KafkaProcess) ([]*KafkaInfo, bool, error) {
 	r, err := hdr.NewBodyReader()
 	if err != nil {
 		return nil, true, err
@@ -225,7 +215,7 @@ func processFetchRequest(hdr kafkaparser.KafkaRequestHeader, kafkaTopicUUIDToNam
 	return infos, false, nil
 }
 
-func processMetadataResponse(rpkt *largebuf.LargeBuffer, hdr kafkaparser.KafkaRequestHeader, kafkaTopicUUIDToName *simplelru.LRU[KafkaTopicKey, string], proc KafkaProcess) ([]*KafkaInfo, bool, error) {
+func processMetadataResponse(rpkt *largebuf.LargeBuffer, hdr kafkaparser.KafkaRequestHeader, kafkaTopicUUIDToName *KafkaTopicNames, proc KafkaProcess) ([]*KafkaInfo, bool, error) {
 	if rpkt == nil {
 		return nil, true, errKafkaNoResponseBufferForMetadata
 	}
@@ -240,7 +230,7 @@ func processMetadataResponse(rpkt *largebuf.LargeBuffer, hdr kafkaparser.KafkaRe
 		return nil, true, err
 	}
 	for _, topic := range metadataResponse.Topics {
-		kafkaTopicUUIDToName.Add(KafkaTopicKey{Proc: proc, UUID: topic.UUID}, topic.Name)
+		kafkaTopicUUIDToName.Add(proc, topic.UUID, topic.Name)
 	}
 	return nil, true, nil
 }
