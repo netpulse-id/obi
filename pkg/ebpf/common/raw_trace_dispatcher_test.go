@@ -22,7 +22,6 @@ import (
 	"go.opentelemetry.io/obi/pkg/config"
 	"go.opentelemetry.io/obi/pkg/ebpf/common/dnsparser"
 	"go.opentelemetry.io/obi/pkg/ebpf/ringbuf"
-	"go.opentelemetry.io/obi/pkg/internal/ebpf/kafkaparser"
 	"go.opentelemetry.io/obi/pkg/internal/largebuf"
 )
 
@@ -87,7 +86,7 @@ func newTraceDispatcherTestContext() (*EBPFParseContext, *config.EBPFTracer, Ser
 		postgresPortals:            newTestLRU[postgresPortalsKey, string](),
 		postgresDBNames:            newTestLRU[BpfConnectionInfoT, string](),
 		mssqlPreparedStatements:    newTestLRU[mssqlPreparedStatementsKey, string](),
-		kafkaTopicUUIDToName:       newTestLRU[kafkaparser.UUID, string](),
+		kafkaTopicUUIDToName:       newTestLRU[KafkaTopicKey, string](),
 		dnsEvents:                  expirable.NewLRU[dnsparser.DNSId, *request.Span](testParseCacheSize, nil, 0),
 		pendingSpanLinks: &pendingSpanLinks{
 			cache:          expirable.NewLRU[spanLinkKey, []request.SpanLink](maxPendingSpanLinks, nil, 0),

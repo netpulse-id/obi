@@ -126,7 +126,21 @@ func skipMetadataPartition(r *largebuf.LargeBufferReader, header KafkaRequestHea
 	return skipTaggedFields(r, header)
 }
 
+// MaxTopicNameLen is the longest topic name Kafka accepts.
+const MaxTopicNameLen = 249
+
+// parseMetadataTopic reads one topic of a Metadata response, nil for a topic whose name
+// is longer than any broker accepts, which names nothing but is still read past so the
+// next topic stays aligned.
 func parseMetadataTopic(r *largebuf.LargeBufferReader, header KafkaRequestHeader, isLast bool) (*MetadataTopic, error) {
+	topic, err := readMetadataTopic(r, header, isLast)
+	if topic != nil && len(topic.Name) > MaxTopicNameLen {
+		return nil, err
+	}
+	return topic, err
+}
+
+func readMetadataTopic(r *largebuf.LargeBufferReader, header KafkaRequestHeader, isLast bool) (*MetadataTopic, error) {
 	var topic MetadataTopic
 	/*
 	  Metadata Response (Version: 10, 11, 12 and 13)

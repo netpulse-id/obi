@@ -52,9 +52,9 @@ type kafkaMember struct {
 
 // addTopics adds topics to the subscription, at most budget new ones (the process' share
 // left, see maxTopicsPerProcess) and maxTopicsPerMember in total.
-func (m *kafkaMember) addTopics(topics []*kafkaparser.GroupTopic, kafkaTopicUUIDToName *simplelru.LRU[kafkaparser.UUID, string], budget int) {
+func (m *kafkaMember) addTopics(topics []*kafkaparser.GroupTopic, kafkaTopicUUIDToName *simplelru.LRU[KafkaTopicKey, string], proc KafkaProcess, budget int) {
 	for _, topic := range topics {
-		name := resolveTopicName(topic.Name, topic.UUID, kafkaTopicUUIDToName)
+		name := resolveTopicName(topic.Name, topic.UUID, kafkaTopicUUIDToName, proc)
 		if name == "" {
 			continue
 		}
@@ -300,7 +300,7 @@ func (g *KafkaConsumerGroups) memberships(proc KafkaProcess) *kafkaProcessGroups
 // known for that member, so a rebalance with a changed subscription drops the old
 // topics; anything else adds to them. Topics referenced by UUID are resolved through
 // kafkaTopicUUIDToName and skipped when unknown.
-func (g *KafkaConsumerGroups) Join(proc KafkaProcess, conn BpfConnectionInfoT, req *kafkaparser.GroupRequest, kafkaTopicUUIDToName *simplelru.LRU[kafkaparser.UUID, string]) {
+func (g *KafkaConsumerGroups) Join(proc KafkaProcess, conn BpfConnectionInfoT, req *kafkaparser.GroupRequest, kafkaTopicUUIDToName *simplelru.LRU[KafkaTopicKey, string]) {
 	if g == nil {
 		return
 	}
@@ -326,9 +326,9 @@ func (g *KafkaConsumerGroups) Join(proc KafkaProcess, conn BpfConnectionInfoT, r
 		})
 	case req.Subscription:
 		m.topics = map[string]struct{}{}
-		m.addTopics(req.Topics, kafkaTopicUUIDToName, state.topicBudget())
+		m.addTopics(req.Topics, kafkaTopicUUIDToName, proc, state.topicBudget())
 	default:
-		m.addTopics(req.Topics, kafkaTopicUUIDToName, state.topicBudget())
+		m.addTopics(req.Topics, kafkaTopicUUIDToName, proc, state.topicBudget())
 	}
 	g.lru.Add(proc, state)
 }
@@ -367,7 +367,7 @@ func (g *KafkaConsumerGroups) Leave(proc KafkaProcess, conn BpfConnectionInfoT, 
 // req's member in proc; the request is ignored when proc does not host that member of
 // that group (OffsetFetch before v9 names no member). It does not renew the membership:
 // these requests are no evidence of it (see Join).
-func (g *KafkaConsumerGroups) Enrich(proc KafkaProcess, req *kafkaparser.GroupRequest, kafkaTopicUUIDToName *simplelru.LRU[kafkaparser.UUID, string]) {
+func (g *KafkaConsumerGroups) Enrich(proc KafkaProcess, req *kafkaparser.GroupRequest, kafkaTopicUUIDToName *simplelru.LRU[KafkaTopicKey, string]) {
 	if g == nil {
 		return
 	}
@@ -383,7 +383,7 @@ func (g *KafkaConsumerGroups) Enrich(proc KafkaProcess, req *kafkaparser.GroupRe
 	if !found {
 		return
 	}
-	m.addTopics(req.Topics, kafkaTopicUUIDToName, state.topicBudget())
+	m.addTopics(req.Topics, kafkaTopicUUIDToName, proc, state.topicBudget())
 }
 
 // Lookup returns the group consuming topic in proc: the one group subscribed to it,

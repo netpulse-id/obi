@@ -34,7 +34,6 @@ import (
 	ebpfhttp "go.opentelemetry.io/obi/pkg/ebpf/common/http"
 	"go.opentelemetry.io/obi/pkg/ebpf/ringbuf"
 	"go.opentelemetry.io/obi/pkg/export/otel/idgen"
-	"go.opentelemetry.io/obi/pkg/internal/ebpf/kafkaparser"
 	"go.opentelemetry.io/obi/pkg/internal/largebuf"
 	"go.opentelemetry.io/obi/pkg/pipe/msg"
 )
@@ -322,7 +321,7 @@ type EBPFParseContext struct {
 	postgresPortals             *simplelru.LRU[postgresPortalsKey, string]
 	postgresDBNames             *simplelru.LRU[BpfConnectionInfoT, string]
 	mssqlPreparedStatements     *simplelru.LRU[mssqlPreparedStatementsKey, string]
-	kafkaTopicUUIDToName        *simplelru.LRU[kafkaparser.UUID, string]
+	kafkaTopicUUIDToName        *simplelru.LRU[KafkaTopicKey, string]
 	kafkaConsumerGroups         *KafkaConsumerGroups
 	payloadExtraction           config.PayloadExtraction
 	httpEnricher                *ebpfhttp.HTTPEnricher
@@ -415,7 +414,7 @@ func NewEBPFParseContext(cfg *config.EBPFTracer, spansChan *msg.Queue[[]request.
 		postgresPreparedStatements *simplelru.LRU[postgresPreparedStatementsKey, string]
 		postgresPortals            *simplelru.LRU[postgresPortalsKey, string]
 		mssqlPreparedStatements    *simplelru.LRU[mssqlPreparedStatementsKey, string]
-		kafkaTopicUUIDToName       *simplelru.LRU[kafkaparser.UUID, string]
+		kafkaTopicUUIDToName       *simplelru.LRU[KafkaTopicKey, string]
 		kafkaConsumerGroups        *KafkaConsumerGroups
 		mongoRequestCache          PendingMongoDBRequests
 		payloadExtraction          config.PayloadExtraction
@@ -477,7 +476,7 @@ func NewEBPFParseContext(cfg *config.EBPFTracer, spansChan *msg.Queue[[]request.
 			ptlog().Error("failed to create MSSQL prepared statements cache", "error", err)
 		}
 
-		kafkaTopicUUIDToName, err = simplelru.NewLRU[kafkaparser.UUID, string](cfg.KafkaTopicUUIDCacheSize, nil)
+		kafkaTopicUUIDToName, err = simplelru.NewLRU[KafkaTopicKey, string](cfg.KafkaTopicUUIDCacheSize, nil)
 		if err != nil {
 			ptlog().Error("failed to create Kafka topic UUID to name cache", "error", err)
 		}

@@ -197,7 +197,7 @@ func TestProcessKafkaRequest(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cache, _ := simplelru.NewLRU[kafkaparser.UUID, string](1000, nil)
+			cache, _ := simplelru.NewLRU[KafkaTopicKey, string](1000, nil)
 			if len(tt.preRequests) > 0 {
 				for _, preInput := range tt.preRequests {
 					_, ignore, err := ProcessKafkaEvent(largebuf.NewLargeBufferFrom(preInput.request), largebuf.NewLargeBufferFrom(preInput.response), cache, nil, KafkaProcess{}, BpfConnectionInfoT{})
@@ -251,10 +251,10 @@ func TestProcessKafkaRequestProduceV13WithTopicCache(t *testing.T) {
 		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 	}
 
-	cache, _ := simplelru.NewLRU[kafkaparser.UUID, string](1000, nil)
+	cache, _ := simplelru.NewLRU[KafkaTopicKey, string](1000, nil)
 
 	uuid := kafkaparser.UUID{172, 231, 101, 123, 36, 212, 77, 228, 142, 87, 26, 240, 250, 236, 204, 15}
-	cache.Add(uuid, "my-topic")
+	cache.Add(KafkaTopicKey{UUID: uuid}, "my-topic")
 
 	infos, ignore, err := ProcessKafkaEvent(largebuf.NewLargeBufferFrom(request), nil, cache, nil, KafkaProcess{}, BpfConnectionInfoT{})
 	require.NoError(t, err)
@@ -368,9 +368,9 @@ var (
 func TestProcessKafkaRequestFetchMultiTopic(t *testing.T) {
 	pkt := fetchV13TwoTopics(fetchUUID1, fetchUUID2)
 
-	cache, _ := simplelru.NewLRU[kafkaparser.UUID, string](1000, nil)
-	cache.Add(fetchUUID1, "topic-one")
-	cache.Add(fetchUUID2, "topic-two")
+	cache, _ := simplelru.NewLRU[KafkaTopicKey, string](1000, nil)
+	cache.Add(KafkaTopicKey{UUID: fetchUUID1}, "topic-one")
+	cache.Add(KafkaTopicKey{UUID: fetchUUID2}, "topic-two")
 
 	infos, ignore, err := ProcessKafkaEvent(largebuf.NewLargeBufferFrom(pkt), nil, cache, nil, KafkaProcess{}, BpfConnectionInfoT{})
 	require.NoError(t, err)
@@ -540,7 +540,7 @@ func newTestConsumerGroups() *KafkaConsumerGroups {
 // processKafka runs one request through the same entry point the TCP pipeline uses.
 func processKafka(t *testing.T, groups *KafkaConsumerGroups, event *TCPRequestInfo, request []byte) ([]*KafkaInfo, bool) {
 	t.Helper()
-	uuidCache, err := simplelru.NewLRU[kafkaparser.UUID, string](16, nil)
+	uuidCache, err := simplelru.NewLRU[KafkaTopicKey, string](16, nil)
 	require.NoError(t, err)
 	infos, ignore, err := ProcessPossibleKafkaEvent(event, largebuf.NewLargeBufferFrom(request), nil, uuidCache, groups)
 	require.NoError(t, err)
@@ -679,10 +679,10 @@ func TestProcessKafkaEventConsumerGroupServerSide(t *testing.T) {
 // with two groups gets nothing.
 func TestProcessKafkaEventConsumerGroupFetchByUUID(t *testing.T) {
 	groups := newTestConsumerGroups()
-	uuidCache, err := simplelru.NewLRU[kafkaparser.UUID, string](16, nil)
+	uuidCache, err := simplelru.NewLRU[KafkaTopicKey, string](16, nil)
 	require.NoError(t, err)
-	uuidCache.Add(fetchUUID1, "orders")
-	uuidCache.Add(fetchUUID2, "payments")
+	uuidCache.Add(KafkaTopicKey{Proc: KafkaProcess{Ns: 7, Pid: 42}, UUID: fetchUUID1}, "orders")
+	uuidCache.Add(KafkaTopicKey{Proc: KafkaProcess{Ns: 7, Pid: 42}, UUID: fetchUUID2}, "payments")
 
 	consumer := kafkaEventFromPid(7, 42)
 	for _, join := range [][]byte{joinGroupMyGroup, joinGroupOtherGroup} {
@@ -705,9 +705,9 @@ func TestProcessKafkaEventConsumerGroupFetchByUUID(t *testing.T) {
 // cache to fill the per-topic entries, and skip the ones the cache does not know yet.
 func TestProcessKafkaEventConsumerGroupEnrichByUUID(t *testing.T) {
 	groups := newTestConsumerGroups()
-	uuidCache, err := simplelru.NewLRU[kafkaparser.UUID, string](16, nil)
+	uuidCache, err := simplelru.NewLRU[KafkaTopicKey, string](16, nil)
 	require.NoError(t, err)
-	uuidCache.Add(fetchUUID1, "orders") // fetchUUID2 (payments) is not resolved yet
+	uuidCache.Add(KafkaTopicKey{Proc: KafkaProcess{Ns: 7, Pid: 42}, UUID: fetchUUID1}, "orders") // fetchUUID2 (payments) is not resolved yet
 
 	consumer := kafkaEventFromPid(7, 42)
 	for _, req := range [][]byte{joinGroupOtherGroup, offsetCommitOtherGroupUUID, joinGroupMyGroup} {
@@ -726,7 +726,7 @@ func TestProcessKafkaEventConsumerGroupEnrichByUUID(t *testing.T) {
 
 	// the unresolved UUID was skipped, not learned under an empty or wrong name:
 	// resolving it later does not retroactively make "payments" ambiguous
-	uuidCache.Add(fetchUUID2, "payments")
+	uuidCache.Add(KafkaTopicKey{Proc: KafkaProcess{Ns: 7, Pid: 42}, UUID: fetchUUID2}, "payments")
 	assert.Equal(t, "other-group", groups.Lookup(proc, "payments"))
 }
 

@@ -17,7 +17,6 @@ import (
 	"go.opentelemetry.io/obi/pkg/config"
 	"go.opentelemetry.io/obi/pkg/ebpf/ringbuf"
 	"go.opentelemetry.io/obi/pkg/internal/ebpf/amqpparser"
-	"go.opentelemetry.io/obi/pkg/internal/ebpf/kafkaparser"
 	"go.opentelemetry.io/obi/pkg/internal/ebpf/mqttparser"
 	"go.opentelemetry.io/obi/pkg/internal/largebuf"
 )
@@ -117,7 +116,7 @@ func dispatchKernelAssignedProtocol(parseCtx *EBPFParseContext, event *TCPReques
 // handleKafkaEvent runs the common Kafka parse-and-emit path shared by dispatchKafka and
 // matchKafkaFallback. On a parse failure it returns the raw error; the caller decides whether
 // to surface it (classified packet) or swallow it as "not Kafka" (fallback path).
-func handleKafkaEvent(parseCtx *EBPFParseContext, event *TCPRequestInfo, requestBuffer, responseBuffer *largebuf.LargeBuffer, kafkaTopicUUIDToName *simplelru.LRU[kafkaparser.UUID, string]) (request.Span, bool, bool, error) {
+func handleKafkaEvent(parseCtx *EBPFParseContext, event *TCPRequestInfo, requestBuffer, responseBuffer *largebuf.LargeBuffer, kafkaTopicUUIDToName *simplelru.LRU[KafkaTopicKey, string]) (request.Span, bool, bool, error) {
 	infos, ignore, err := ProcessPossibleKafkaEvent(event, requestBuffer, responseBuffer, kafkaTopicUUIDToName, parseCtx.kafkaConsumerGroups)
 
 	if ignore && err == nil {
@@ -134,7 +133,7 @@ func handleKafkaEvent(parseCtx *EBPFParseContext, event *TCPRequestInfo, request
 	return request.Span{}, false, false, err
 }
 
-func dispatchKafka(parseCtx *EBPFParseContext, event *TCPRequestInfo, requestBuffer, responseBuffer *largebuf.LargeBuffer, kafkaTopicUUIDToName *simplelru.LRU[kafkaparser.UUID, string]) (request.Span, bool, bool, error) {
+func dispatchKafka(parseCtx *EBPFParseContext, event *TCPRequestInfo, requestBuffer, responseBuffer *largebuf.LargeBuffer, kafkaTopicUUIDToName *simplelru.LRU[KafkaTopicKey, string]) (request.Span, bool, bool, error) {
 	span, ignore, matched, err := handleKafkaEvent(parseCtx, event, requestBuffer, responseBuffer, kafkaTopicUUIDToName)
 	if err != nil {
 		return request.Span{}, true, true, fmt.Errorf("failed to handle Kafka event: %w", err)
@@ -591,7 +590,7 @@ func matchMQTT(event *TCPRequestInfo, requestBuffer, responseBuffer *largebuf.La
 
 // matchKafkaFallback handles Kafka for unclassified packets (e.g. when the kernel missed the
 // connection start). Unlike dispatchKafka, errors here mean "not Kafka" — no error is surfaced.
-func matchKafkaFallback(parseCtx *EBPFParseContext, event *TCPRequestInfo, requestBuffer, responseBuffer *largebuf.LargeBuffer, kafkaTopicUUIDToName *simplelru.LRU[kafkaparser.UUID, string]) (request.Span, bool, bool, error) { //nolint:unparam
+func matchKafkaFallback(parseCtx *EBPFParseContext, event *TCPRequestInfo, requestBuffer, responseBuffer *largebuf.LargeBuffer, kafkaTopicUUIDToName *simplelru.LRU[KafkaTopicKey, string]) (request.Span, bool, bool, error) { //nolint:unparam
 	span, ignore, matched, err := handleKafkaEvent(parseCtx, event, requestBuffer, responseBuffer, kafkaTopicUUIDToName)
 	if err != nil {
 		return request.Span{}, false, false, nil // parse failed on an unclassified packet — treat as "not Kafka"
