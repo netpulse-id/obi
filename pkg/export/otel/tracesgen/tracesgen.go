@@ -39,6 +39,11 @@ import (
 
 const userAgentHeader = "user-agent"
 
+// ManualSpanScopeAttr marks the instrumentation scope of a span an application made
+// through the Go Auto SDK, so a consumer tells it from a span OBI made itself whatever
+// scope the application named, its own empty one included.
+const ManualSpanScopeAttr = "obi.manual_span"
+
 // userAgentAttributes reports user_agent.original, which semconv makes
 // recommended on server spans and opt-in on client spans.
 //
@@ -252,6 +257,9 @@ func generateTracesWithAttributes(
 		}
 
 		ss := rs.ScopeSpans().AppendEmpty()
+		if span.Type == request.EventTypeManualSpan {
+			ss.Scope().Attributes().PutBool(ManualSpanScopeAttr, true)
+		}
 
 		t := span.Timings()
 		start := spanStartTime(t)
@@ -365,6 +373,8 @@ func appendManualOTelJSON(rs ptrace.ResourceSpans, payload []byte) error {
 
 	dst := rs.ScopeSpans().AppendEmpty()
 	scopeSpans.At(0).CopyTo(dst)
+	// Set after the copy, so the application's own scope can neither carry nor remove it.
+	dst.Scope().Attributes().PutBool(ManualSpanScopeAttr, true)
 	return nil
 }
 

@@ -1216,6 +1216,53 @@ func TestAppendManualOTelJSONNormalizesSpanKind(t *testing.T) {
 	}
 }
 
+// A span an application made carries the manual-span scope marker whatever scope it named,
+// an empty one or one that names the marker false.
+func TestAppendManualOTelJSONMarksTheScope(t *testing.T) {
+	for name, scope := range map[string]func(pcommon.InstrumentationScope){
+		"empty scope": func(pcommon.InstrumentationScope) {},
+		"named scope": func(s pcommon.InstrumentationScope) { s.SetName("orders") },
+		"forged false": func(s pcommon.InstrumentationScope) {
+			s.Attributes().PutBool(ManualSpanScopeAttr, false)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			traces := ptrace.NewTraces()
+			ss := traces.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty()
+			scope(ss.Scope())
+			span := ss.Spans().AppendEmpty()
+			span.SetTraceID(pcommon.TraceID{1})
+			span.SetSpanID(pcommon.SpanID{1})
+			span.SetStartTimestamp(1)
+			span.SetEndTimestamp(2)
+
+			rs := ptrace.NewResourceSpans()
+			require.NoError(t, appendManualOTelJSON(rs, marshalTracesJSON(t, traces)))
+			marker, ok := rs.ScopeSpans().At(0).Scope().Attributes().Get(ManualSpanScopeAttr)
+			require.True(t, ok)
+			assert.True(t, marker.Bool())
+		})
+	}
+}
+
+// A manual span read without a Go Auto SDK payload, and a span OBI made itself, are told
+// apart by the manual-span scope marker.
+func TestGenerateTracesMarksOnlyManualSpans(t *testing.T) {
+	cache := expirable2.NewLRU[svc.UID, []attribute.KeyValue](10, nil, 0)
+	service := &svc.Attrs{UID: svc.UID{Name: "checkout"}}
+	traces := GenerateTracesWithAttributes(cache, service, nil, &metadata.NodeMeta{}, []TraceSpanAndAttributes{
+		{Span: &request.Span{Type: request.EventTypeManualSpan, SpanKind: trace2.SpanKindInternal, Method: "manual"}},
+		{Span: &request.Span{Type: request.EventTypeHTTP, Method: "GET", Path: "/orders"}},
+	}, "obi")
+
+	scopes := traces.ResourceSpans().At(0).ScopeSpans()
+	require.Equal(t, 2, scopes.Len())
+	_, manual := scopes.At(0).Scope().Attributes().Get(ManualSpanScopeAttr)
+	_, own := scopes.At(1).Scope().Attributes().Get(ManualSpanScopeAttr)
+	assert.True(t, manual)
+	assert.False(t, own)
+}
+
 func TestManualSpanKind(t *testing.T) {
 	assert.Equal(t, trace2.SpanKindServer, spanKind(&request.Span{
 		Type:     request.EventTypeManualSpan,
