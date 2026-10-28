@@ -158,6 +158,12 @@ type NetworkConfig struct {
 	// narrowest CIDR. By this reason, you can safely add a 0.0.0.0/0 entry to group there
 	// all the traffic that does not match any of the other CIDRs.
 	CIDRs cidr.Definitions `yaml:"cidrs" env:"OTEL_EBPF_NETWORK_CIDRS"`
+
+	// LocalRangesFile names a file of the address ranges local to this node (its pods, its peers
+	// and its container networks), one prefix per line, re-read while it changes. A client end in
+	// one of them is never collapsed as a public client; a line "complete ipv6" lets public IPv6
+	// clients collapse.
+	LocalRangesFile string `yaml:"local_ranges_file" env:"OTEL_EBPF_NETWORK_LOCAL_RANGES_FILE"`
 }
 
 var DefaultNetworkConfig = NetworkConfig{

@@ -12,6 +12,8 @@ import (
 const (
 	// PublicClientsV4 is what the client end of a connection is reported as when it is a public IPv4 address.
 	PublicClientsV4 = "0.0.0.0/0"
+	// PublicClientsV6 is what the client end of a connection is reported as when it is a public IPv6 address.
+	PublicClientsV6 = "::/0"
 
 	// hostAddrsRefresh is how often the addresses of the host's own interfaces are read again.
 	hostAddrsRefresh = 30 * time.Second
@@ -72,24 +74,30 @@ func remotePublic(ip net.IP, hostIP string, now time.Time) bool {
 }
 
 // localEnd reports whether an address is the server end of a connection to this host's
-// workloads: a private or shared address, or one of the host's own.
-func localEnd(ip net.IP, hostIP string, now time.Time) bool {
-	return ip.IsPrivate() || notPublic[0].Contains(ip) || ip.String() == hostIP || hostAddress(ip, now)
+// workloads: a private or shared address, one of the host's own, or one of the local ranges.
+func localEnd(ip net.IP, hostIP string, now time.Time, ranges localRangeSet) bool {
+	return ip.IsPrivate() || notPublic[0].Contains(ip) || ip.String() == hostIP || hostAddress(ip, now) || ranges.contains(ip)
 }
 
 // PublicClient returns what the client end of a connection is reported as when it is a
-// remote public IPv4 address calling a server end that is private or the host's own, so the
-// connections of every public client of a host fold into one value per local end; false for
-// any other pair and for every IPv6 client, so a pod with a global address keeps its own end.
+// remote public address outside the local ranges calling a server end that is private, the
+// host's own or local, so the connections of every public client of a host fold into one value
+// per local end; false for any other pair, and for every IPv6 client unless the local ranges
+// name every IPv6 range of this node, so a pod with a global address keeps its own end.
 func PublicClient(client, server *IPAddr, hostIP string) (string, bool) {
 	ip := client.IP()
-	// A global IPv6 address may be a pod's of this node, which no address class tells from an internet client's.
-	if ip.To4() == nil {
-		return "", false
-	}
 	now := time.Now()
-	if !remotePublic(ip, hostIP, now) || !localEnd(server.IP(), hostIP, now) {
+	ranges := currentLocalRanges(now)
+	v4 := ip.To4() != nil
+	// A global IPv6 address may be a pod's of this node, which only a complete set of local ranges tells from an internet client's.
+	if !v4 && !ranges.ipv6Whole {
 		return "", false
 	}
-	return PublicClientsV4, true
+	if !remotePublic(ip, hostIP, now) || !localEnd(server.IP(), hostIP, now, ranges) || ranges.contains(ip) {
+		return "", false
+	}
+	if v4 {
+		return PublicClientsV4, true
+	}
+	return PublicClientsV6, true
 }

@@ -22,6 +22,7 @@ import (
 	"go.opentelemetry.io/obi/pkg/export/otel/otelcfg"
 	"go.opentelemetry.io/obi/pkg/health"
 	"go.opentelemetry.io/obi/pkg/internal/appolly"
+	"go.opentelemetry.io/obi/pkg/internal/pipe"
 	"go.opentelemetry.io/obi/pkg/kube"
 	"go.opentelemetry.io/obi/pkg/metadata"
 	netagent "go.opentelemetry.io/obi/pkg/netolly/agent"
@@ -289,6 +290,7 @@ func BuildCommonContextInfo(
 	}
 
 	attributeGroups(config, ctxInfo)
+	pipe.SetLocalRangesFile(config.NetworkFlows.LocalRangesFile)
 
 	return ctxInfo, nil
 }
