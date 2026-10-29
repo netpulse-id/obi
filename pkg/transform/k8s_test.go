@@ -1125,15 +1125,18 @@ func TestApplyKubeMetadata_ThePodDeclaresNoProvenance(t *testing.T) {
 	inf.Notify(&informer.Event{Type: informer.EventType_CREATED, Resource: &informer.ObjectMeta{
 		Name: "api-0", Namespace: "ns1", Kind: "Pod",
 		Annotations: map[string]string{
-			"resource.opentelemetry.io/k8s.node.name":          "other-node",
-			"resource.opentelemetry.io/deployment.environment": "canary",
+			"resource.opentelemetry.io/k8s.node.name":            "other-node",
+			"resource.opentelemetry.io/deployment.environment":   "canary",
+			"resource.opentelemetry.io/telemetry.distro.version": "9.9.9",
+			"resource.opentelemetry.io/os.type":                  "windows",
 		},
 		Pod: &informer.PodInfo{
 			NodeName: "node-1", Uid: "uid-1", StartTimeStr: "2020-01-02 12:56:56",
 			Owners: []*informer.Owner{{Kind: "Deployment", Name: "api"}},
 			Containers: []*informer.ContainerInfo{{
 				Name: "app", Id: "container-1",
-				Env: map[string]string{"OTEL_RESOURCE_ATTRIBUTES": "k8s.namespace.name=ns2,k8s.pod.name=other-0,container.id=B,k8s.deployment.name=ledger"},
+				Env: map[string]string{"OTEL_RESOURCE_ATTRIBUTES": "k8s.namespace.name=ns2,k8s.pod.name=other-0,container.id=B,k8s.deployment.name=ledger," +
+					"telemetry.sdk.language=forged,telemetry.sdk.name=forged,telemetry.sdk.version=0.0.1,telemetry.distro.name=other"},
 			}},
 		},
 	}})
@@ -1149,4 +1152,7 @@ func TestApplyKubeMetadata_ThePodDeclaresNoProvenance(t *testing.T) {
 	assert.Equal(t, "api", s.Metadata[attr.K8sDeploymentName])
 	assert.NotContains(t, s.Metadata, attr.ContainerID, "OBI resolves no container id for a pod, and the pod declares none")
 	assert.Equal(t, "canary", s.Metadata[attr.Name("deployment.environment")])
+	for _, key := range []string{"telemetry.distro.version", "telemetry.distro.name", "telemetry.sdk.language", "telemetry.sdk.name", "telemetry.sdk.version", "os.type"} {
+		assert.NotContains(t, s.Metadata, attr.Name(key))
+	}
 }

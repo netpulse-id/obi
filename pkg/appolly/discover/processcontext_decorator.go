@@ -165,19 +165,20 @@ func (pcd *processContextDecorator) applyContext(entry *processEntry) {
 // publishes, while the process may still update its own.
 func (pcd *processContextDecorator) addAttribute(entry *processEntry, key attr.Name, value string) {
 	fi := entry.fi
-	svcAttrs := fi.ServiceAttrs()
-
-	if current, ok := svcAttrs.Metadata[key]; ok {
-		if published, own := entry.published[key]; !own || published != current {
-			return
+	set := false
+	fi.UpdateMetadata(func(m map[attr.Name]string) {
+		if current, ok := m[key]; ok {
+			if published, own := entry.published[key]; !own || published != current {
+				return
+			}
 		}
+		m[key] = value
+		set = true
+	})
+	if !set {
+		return
 	}
-	m := svcAttrs.Metadata
-	if m == nil {
-		m = make(map[attr.Name]string)
-	}
-	m[key] = value
-	fi.SetMetadata(m)
+	svcAttrs := fi.ServiceAttrs()
 	if entry.published == nil {
 		entry.published = make(map[attr.Name]string)
 	}

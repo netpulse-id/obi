@@ -13,11 +13,12 @@ import (
 type VarHandler func(k string, v string)
 
 // provenanceKeyPrefixes and provenanceKeys name the resource keys that say where the
-// telemetry came from. OBI resolves them from the kernel, the cgroup and the Kubernetes
-// API, so a target's own declaration of one (its OTEL_RESOURCE_ATTRIBUTES, its pod's
-// resource annotations or mapped labels) is never taken.
+// telemetry came from and what produced it. OBI resolves them from the kernel, the cgroup
+// and the Kubernetes API, or writes them itself, so a target's own declaration of one
+// (its OTEL_RESOURCE_ATTRIBUTES, its process context, its pod's resource annotations or
+// mapped labels) is never taken.
 var (
-	provenanceKeyPrefixes = []string{"container.", "k8s.", "host.", "process."}
+	provenanceKeyPrefixes = []string{"container.", "k8s.", "host.", "process.", "telemetry.", "os."}
 	provenanceKeys        = []string{"service.instance.id"}
 )
 

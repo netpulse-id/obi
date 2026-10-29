@@ -19,8 +19,8 @@ import (
 )
 
 // The resource a process publishes in its OTEL_CTX mapping never puts a key that says
-// where the telemetry came from on its resource, and never replaces a value OBI
-// resolved; its other keys still arrive, and the process may update them later.
+// where the telemetry came from or what produced it on its resource, and never replaces
+// a value OBI resolved; its other keys still arrive, and the process may update them later.
 func TestApplyContext_TheProcessDeclaresNoProvenance(t *testing.T) {
 	fi := execpkg.New(execpkg.Init{Service: svc.Attrs{
 		UID:      svc.UID{Name: "frontend", Namespace: "shop", Instance: "frontend-0"},
@@ -50,6 +50,9 @@ func TestApplyContext_TheProcessDeclaresNoProvenance(t *testing.T) {
 		attribute.String("k8s.namespace.name", "ns2"), attribute.String("k8s.pod.name", "other-0"),
 		attribute.String("host.name", "elsewhere"), attribute.String("process.pid", "1"),
 		attribute.String("service.instance.id", "other-0"),
+		attribute.String("telemetry.distro.version", "9.9.9"), attribute.String("telemetry.distro.name", "other"),
+		attribute.String("telemetry.sdk.language", "forged"), attribute.String("telemetry.sdk.name", "forged"),
+		attribute.String("telemetry.sdk.version", "0.0.1"), attribute.String("os.type", "windows"),
 		attribute.String("deployment.environment", "canary"), attribute.String("team", "payments"))}
 	pcd.applyContext(entry)
 
@@ -63,6 +66,13 @@ func TestApplyContext_TheProcessDeclaresNoProvenance(t *testing.T) {
 	assert.Equal(t, "payments", got["team"])
 	for _, key := range []string{"container.name", "process.pid"} {
 		assert.NotContains(t, got, key)
+	}
+	assert.Equal(t, "linux", got["os.type"])
+	for key, forged := range map[string]string{
+		"telemetry.distro.version": "9.9.9", "telemetry.distro.name": "other",
+		"telemetry.sdk.language": "forged", "telemetry.sdk.name": "forged", "telemetry.sdk.version": "0.0.1",
+	} {
+		assert.NotEqual(t, forged, got[key], key)
 	}
 
 	entry.contextInfo = processcontext.Info{ResourceAttrs: attribute.NewSet(
