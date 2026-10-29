@@ -822,3 +822,25 @@ func TestGetAppResourceAttrs_TheTargetDeclaresNoProvenance(t *testing.T) {
 	}
 	assert.Equal(t, map[string]string{"deployment.environment": "canary"}, resourceAttrsMap(ResourceAttrsFromEnv(&service)))
 }
+
+// A target's own OTEL_RESOURCE_ATTRIBUTES is taken literally: a reference in it is never
+// expanded against OBI's environment, so it reads nothing of OBI's and declares no key
+// through a default value.
+func TestResourceAttrsFromEnv_TheTargetValueIsNotExpanded(t *testing.T) {
+	t.Setenv("OBI_ONLY_SETTING", "obi-value")
+	service := svc.Attrs{UID: svc.UID{Name: "frontend", Instance: "frontend-0"}, EnvVars: map[string]string{
+		envResourceAttrs: "leak=x${OBI_ONLY_SETTING},paren=$(OBI_ONLY_SETTING),inject=${UNSET_SETTING:-container.id=Z}",
+	}}
+
+	attrs := resourceAttrsMap(ResourceAttrsFromEnv(&service))
+
+	assert.Equal(t, map[string]string{
+		"leak":   "x${OBI_ONLY_SETTING}",
+		"paren":  "$(OBI_ONLY_SETTING)",
+		"inject": "${UNSET_SETTING:-container.id=Z}",
+	}, attrs)
+
+	resource := resourceAttrsMap(GetAppResourceAttrs(&metadata.NodeMeta{}, &service))
+	assert.Equal(t, "x${OBI_ONLY_SETTING}", resource["leak"])
+	assert.NotContains(t, resource, "container.id")
+}

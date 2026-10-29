@@ -568,7 +568,8 @@ func HeadersFromEnv(varName string) map[string]string {
 // in the format specified by OTEL_EXPORTER_OTLP_*HEADERS or
 // OTEL_RESOURCE_ATTRIBUTES, i.e. a comma-separated list of
 // key=values. For example: api-key=key,other-config-value=value
-// The values are passed as parameters to the handler function
+// The values are passed as parameters to the handler function.
+// References to OBI's own environment in the value are expanded first.
 func parseOTELEnvVar(envVar string, handler attributes.VarHandler) {
 	expandedValue := string(config.ReplaceEnv([]byte(envVar)))
 	attributes.ParseOTELResourceVariable(expandedValue, handler)
@@ -586,7 +587,8 @@ func parseProcessOTELEnvVar(varName string, handler attributes.VarHandler) {
 }
 
 // parseServiceOTELEnvVar parses varName from the environment of a single instrumented
-// process, which is the target's own declaration of it.
+// process, which is the target's own declaration of it. The value is taken literally:
+// a ${VAR} or $(VAR) reference in it is never expanded against OBI's own environment.
 func parseServiceOTELEnvVar(service *svc.Attrs, varName string, handler attributes.VarHandler) {
 	if service == nil || service.EnvVars == nil {
 		return
@@ -597,7 +599,7 @@ func parseServiceOTELEnvVar(service *svc.Attrs, varName string, handler attribut
 		return
 	}
 
-	parseOTELEnvVar(envVar, handler)
+	attributes.ParseOTELResourceVariable(envVar, handler)
 }
 
 // ResourceAttrsFromEnv returns the resource attributes the instrumented target declares

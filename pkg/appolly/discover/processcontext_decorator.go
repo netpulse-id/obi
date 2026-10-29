@@ -15,6 +15,7 @@ import (
 	"go.opentelemetry.io/obi/pkg/appolly/app"
 	execpkg "go.opentelemetry.io/obi/pkg/appolly/discover/exec"
 	"go.opentelemetry.io/obi/pkg/ebpf"
+	"go.opentelemetry.io/obi/pkg/export/attributes"
 	attr "go.opentelemetry.io/obi/pkg/export/attributes/names"
 	"go.opentelemetry.io/obi/pkg/internal/procs"
 	"go.opentelemetry.io/obi/pkg/pipe/msg"
@@ -45,6 +46,9 @@ func ProcessContextDecoratorProvider(
 type processEntry struct {
 	fi          *execpkg.FileInfo
 	contextInfo processcontext.Info
+	// published holds the values this decorator wrote into the process metadata, so
+	// a later context update replaces them and nothing else.
+	published map[attr.Name]string
 }
 
 // processContextDecorator enriches discovered processes with context information
@@ -120,7 +124,7 @@ func (pcd *processContextDecorator) pollEntry(pid app.PID, entry *processEntry) 
 	rm := remotememory.NewProcessVirtualMemory(libpf.PID(pid))
 	entry.contextInfo = processcontext.Resolve(
 		uint64(mappingAddr), libpf.PID(pid), rm, entry.contextInfo, nil)
-	pcd.applyContext(entry.fi, entry.contextInfo)
+	pcd.applyContext(entry)
 }
 
 func (pcd *processContextDecorator) findOTELContextMapping(pid app.PID) (libpf.Address, bool) {
@@ -138,27 +142,46 @@ func (pcd *processContextDecorator) findOTELContextMapping(pid app.PID) (libpf.A
 	return 0, false
 }
 
-func (pcd *processContextDecorator) applyContext(fi *execpkg.FileInfo, info processcontext.Info) {
-	for _, kv := range info.ResourceAttrs.ToSlice() {
+// applyContext adds the resource attributes a process publishes in its OTEL_CTX mapping,
+// without the keys that say where the telemetry came from: the process memory is the
+// workload's own declaration and never names its container, pod, host or instance.
+func (pcd *processContextDecorator) applyContext(entry *processEntry) {
+	for _, kv := range entry.contextInfo.ResourceAttrs.ToSlice() {
+		if attributes.ProvenanceKey(string(kv.Key)) {
+			continue
+		}
 		if kv.Value.Type() != attribute.STRING {
 			pcd.log.Debug("attribute value is not a string type", "type", kv.Value.Type())
 			continue
 		}
 		if value := kv.Value.AsString(); value != "" {
-			pcd.addAttribute(fi, attr.Name(kv.Key), value)
+			pcd.addAttribute(entry, attr.Name(kv.Key), value)
 		}
 	}
 }
 
-func (pcd *processContextDecorator) addAttribute(fi *execpkg.FileInfo, key attr.Name, value string) {
+// addAttribute sets key in the process metadata unless something other than an earlier
+// process context set it, so a value OBI resolved is never replaced by one the process
+// publishes, while the process may still update its own.
+func (pcd *processContextDecorator) addAttribute(entry *processEntry, key attr.Name, value string) {
+	fi := entry.fi
 	svcAttrs := fi.ServiceAttrs()
 
+	if current, ok := svcAttrs.Metadata[key]; ok {
+		if published, own := entry.published[key]; !own || published != current {
+			return
+		}
+	}
 	m := svcAttrs.Metadata
 	if m == nil {
 		m = make(map[attr.Name]string)
 	}
 	m[key] = value
 	fi.SetMetadata(m)
+	if entry.published == nil {
+		entry.published = make(map[attr.Name]string)
+	}
+	entry.published[key] = value
 
 	// Populate service UID from process context attributes, but only if not
 	// already explicitly set. This allows process-level metadata to establish

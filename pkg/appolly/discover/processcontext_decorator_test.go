@@ -314,8 +314,9 @@ func TestProcessContextDecorator_AddAttribute_PreservesExplicitUID(t *testing.T)
 		Pid:        app.PID(os.Getpid()),
 	})
 
-	pcd.addAttribute(fi, attr.ServiceName, "from-context")
-	pcd.addAttribute(fi, attr.ServiceNamespace, "from-context-ns")
+	entry := &processEntry{fi: fi}
+	pcd.addAttribute(entry, attr.ServiceName, "from-context")
+	pcd.addAttribute(entry, attr.ServiceNamespace, "from-context-ns")
 
 	attrs := fi.ServiceAttrs()
 	// Metadata gets the value from the context.
