@@ -1115,3 +1115,38 @@ func (f *fakeInformer) Notify(event *informer.Event) {
 		_ = observer.On(event)
 	}
 }
+
+// A pod's own declarations (its resource annotations and the OTEL_RESOURCE_ATTRIBUTES of
+// its containers) never replace the Kubernetes keys OBI resolved for it, and a declared
+// key that says nothing about where the telemetry came from still arrives.
+func TestApplyKubeMetadata_ThePodDeclaresNoProvenance(t *testing.T) {
+	inf := &fakeInformer{}
+	store := kube.NewStore(inf, kube.ResourceLabels{}, nil, imetrics.NoopReporter{})
+	inf.Notify(&informer.Event{Type: informer.EventType_CREATED, Resource: &informer.ObjectMeta{
+		Name: "api-0", Namespace: "ns1", Kind: "Pod",
+		Annotations: map[string]string{
+			"resource.opentelemetry.io/k8s.node.name":          "other-node",
+			"resource.opentelemetry.io/deployment.environment": "canary",
+		},
+		Pod: &informer.PodInfo{
+			NodeName: "node-1", Uid: "uid-1", StartTimeStr: "2020-01-02 12:56:56",
+			Owners: []*informer.Owner{{Kind: "Deployment", Name: "api"}},
+			Containers: []*informer.ContainerInfo{{
+				Name: "app", Id: "container-1",
+				Env: map[string]string{"OTEL_RESOURCE_ATTRIBUTES": "k8s.namespace.name=ns2,k8s.pod.name=other-0,container.id=B,k8s.deployment.name=ledger"},
+			}},
+		},
+	}})
+	meta := store.PodByContainerID("container-1")
+	require.NotNil(t, meta)
+	s := svc.Attrs{UID: svc.UID{Name: "api", Namespace: "shop"}}
+
+	require.True(t, applyKubeMetadata(store, &s, meta, "cluster", "app"))
+
+	assert.Equal(t, "ns1", s.Metadata[attr.K8sNamespaceName])
+	assert.Equal(t, "api-0", s.Metadata[attr.K8sPodName])
+	assert.Equal(t, "node-1", s.Metadata[attr.K8sNodeName])
+	assert.Equal(t, "api", s.Metadata[attr.K8sDeploymentName])
+	assert.NotContains(t, s.Metadata, attr.ContainerID, "OBI resolves no container id for a pod, and the pod declares none")
+	assert.Equal(t, "canary", s.Metadata[attr.Name("deployment.environment")])
+}

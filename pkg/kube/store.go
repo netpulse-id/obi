@@ -170,7 +170,7 @@ func (s *Store) cacheResourceMetadata(meta *informer.ObjectMeta) *kube.CachedObj
 	if len(meta.Labels) > 0 {
 		for propertyName, labels := range s.resourceLabels {
 			for _, label := range labels {
-				if val := meta.Labels[label]; val != "" {
+				if val := meta.Labels[label]; val != "" && !attributes.ProvenanceKey(propertyName) {
 					com.OTELResourceMeta[attr.Name(propertyName)] = val
 					break
 				}
@@ -183,6 +183,9 @@ func (s *Store) cacheResourceMetadata(meta *informer.ObjectMeta) *kube.CachedObj
 			continue
 		}
 		propertyName := labelName[len(ResourceAttributesPrefix):]
+		if attributes.ProvenanceKey(propertyName) {
+			continue
+		}
 		com.OTELResourceMeta[attr.Name(propertyName)] = labelValue
 	}
 	// override with metadata from OTEL_RESOURCE_ATTRIBUTES, OTEL_SERVICE_NAME and OTEL_SERVICE_NAMESPACE
@@ -191,7 +194,7 @@ func (s *Store) cacheResourceMetadata(meta *informer.ObjectMeta) *kube.CachedObj
 			continue
 		}
 		attributes.ParseOTELResourceVariable(cnt.Env[EnvResourceAttributes], func(k, v string) {
-			if v != "" && !strings.HasPrefix(v, "$") {
+			if v != "" && !strings.HasPrefix(v, "$") && !attributes.ProvenanceKey(k) {
 				com.OTELResourceMeta[attr.Name(k)] = v
 			}
 		})

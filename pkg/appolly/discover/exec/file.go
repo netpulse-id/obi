@@ -295,7 +295,8 @@ func (fi *FileInfo) ApplyEnvVariables(envVars map[string]string) {
 	if resourceAttrs, ok := fi.service.EnvVars[envResourceAttrs]; ok {
 		attributes.ParseOTELResourceVariable(resourceAttrs, func(k, v string) { allVars[k] = v })
 		for k, v := range allVars {
-			if v != "" && !strings.HasPrefix(v, "$") {
+			// A key that says where the telemetry came from is OBI's to resolve.
+			if v != "" && !strings.HasPrefix(v, "$") && !attributes.ProvenanceKey(k) {
 				key := attr.Name(k)
 				if _, exists := m[key]; !exists {
 					m[key] = v

@@ -600,34 +600,13 @@ func parseServiceOTELEnvVar(service *svc.Attrs, varName string, handler attribut
 	parseOTELEnvVar(envVar, handler)
 }
 
-// provenanceKeyPrefixes and provenanceKeys name the resource keys that say where the
-// telemetry came from. OBI resolves them from the kernel, the cgroup and the Kubernetes
-// API, so a target's own declaration of one is never taken.
-var (
-	provenanceKeyPrefixes = []string{"container.", "k8s.", "host.", "process."}
-	provenanceKeys        = []string{string(semconv.ServiceInstanceIDKey)}
-)
-
-// provenanceKey reports whether a resource key says where the telemetry came from.
-func provenanceKey(key string) bool {
-	if slices.Contains(provenanceKeys, key) {
-		return true
-	}
-	for _, prefix := range provenanceKeyPrefixes {
-		if strings.HasPrefix(key, prefix) {
-			return true
-		}
-	}
-	return false
-}
-
 // ResourceAttrsFromEnv returns the resource attributes the instrumented target declares
 // in its own OTEL_RESOURCE_ATTRIBUTES, without the provenance keys. They rank below
 // the metadata OBI resolved, so GetAppResourceAttrs places them before it.
 func ResourceAttrsFromEnv(svc *svc.Attrs, attrSelector ...attributes.Selection) []attribute.KeyValue {
 	var otelResourceAttrs []attribute.KeyValue
 	apply := func(k string, v string) {
-		if provenanceKey(k) {
+		if attributes.ProvenanceKey(k) {
 			return
 		}
 		otelResourceAttrs = append(otelResourceAttrs, attribute.String(k, v))

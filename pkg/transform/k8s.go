@@ -513,6 +513,8 @@ func applyKubeMetadata(store *kube.Store, s *svc.Attrs, meta *ikube.CachedObjMet
 	if s.Metadata != nil {
 		maps.Copy(m, s.Metadata)
 	}
+	// What the pod declares ranks below what OBI resolved for it.
+	maps.Copy(m, meta.OTELResourceMeta)
 	maps.Copy(m, k8sMeta)
 
 	// ownerKind could be also "Pod", but we won't insert it as "owner" label to avoid
@@ -530,8 +532,6 @@ func applyKubeMetadata(store *kube.Store, s *svc.Attrs, meta *ikube.CachedObjMet
 			m[kindLabel] = owner.Name
 		}
 	}
-
-	maps.Copy(m, meta.OTELResourceMeta)
 
 	s.Metadata = m
 	s.HostName = meta.Meta.Name
