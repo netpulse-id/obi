@@ -758,8 +758,8 @@ func TestGetAppResourceAttrs_ProcessEnvObeysResourceSelection(t *testing.T) {
 	assert.NotContains(t, attrs, "cloud.account.id")
 }
 
-// The full precedence order, as the exporters assemble it: the target's own
-// OTEL_RESOURCE_ATTRIBUTES, then the metadata OBI resolved, then OBI's own environment.
+// The full precedence order, as the exporters assemble it: the metadata OBI resolved,
+// then the target's own OTEL_RESOURCE_ATTRIBUTES, then OBI's own environment.
 func TestResourceAttrs_PrecedenceOrder(t *testing.T) {
 	t.Setenv(envResourceAttrs, "deployment.environment=prod,k8s.pod.name=obi-collector-marker,test.marker=obi-env-probe")
 
@@ -772,8 +772,7 @@ func TestResourceAttrs_PrecedenceOrder(t *testing.T) {
 		EnvVars: map[string]string{envResourceAttrs: "deployment.environment=canary"},
 	}
 
-	merged := append(GetAppResourceAttrs(&nodeMeta, &service), ResourceAttrsFromEnv(&service)...)
-	attrs := attribute.NewSet(merged...)
+	attrs := attribute.NewSet(GetAppResourceAttrs(&nodeMeta, &service)...)
 
 	environment, ok := attrs.Value("deployment.environment")
 	require.True(t, ok)
@@ -788,4 +787,38 @@ func TestResourceAttrs_PrecedenceOrder(t *testing.T) {
 	marker, ok := attrs.Value("test.marker")
 	require.True(t, ok)
 	assert.Equal(t, "obi-env-probe", marker.Emit())
+}
+
+// provenanceService is a target whose resolved metadata names container A in namespace
+// ns1 while its own OTEL_RESOURCE_ATTRIBUTES claims container B in namespace ns2.
+func provenanceService() svc.Attrs {
+	return svc.Attrs{
+		UID:      svc.UID{Name: "frontend", Namespace: "shop", Instance: "frontend-0"},
+		HostName: "node-1",
+		Metadata: map[attr.Name]string{
+			attr.ContainerID:      "A",
+			attr.K8sNamespaceName: "ns1",
+		},
+		EnvVars: map[string]string{envResourceAttrs: "container.id=B,container.name=other,k8s.namespace.name=ns2,k8s.pod.name=other-0," +
+			"host.name=elsewhere,process.pid=1,service.instance.id=other-0,deployment.environment=canary"},
+	}
+}
+
+// A target cannot declare where its telemetry came from: the container, Kubernetes,
+// host, process and instance keys OBI resolved win, and the target's other keys stay.
+func TestGetAppResourceAttrs_TheTargetDeclaresNoProvenance(t *testing.T) {
+	service := provenanceService()
+
+	set := attribute.NewSet(GetAppResourceAttrs(&metadata.NodeMeta{HostID: "host-id"}, &service)...)
+	attrs := resourceAttrsMap(set.ToSlice())
+
+	assert.Equal(t, "A", attrs["container.id"])
+	assert.Equal(t, "ns1", attrs["k8s.namespace.name"])
+	assert.Equal(t, "node-1", attrs["host.name"])
+	assert.Equal(t, "frontend-0", attrs["service.instance.id"])
+	assert.Equal(t, "canary", attrs["deployment.environment"])
+	for _, key := range []string{"container.name", "k8s.pod.name", "process.pid"} {
+		assert.NotContains(t, attrs, key)
+	}
+	assert.Equal(t, map[string]string{"deployment.environment": "canary"}, resourceAttrsMap(ResourceAttrsFromEnv(&service)))
 }

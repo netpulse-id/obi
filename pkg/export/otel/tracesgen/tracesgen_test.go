@@ -2302,3 +2302,29 @@ func TestGenAISpanNameMatchesEmittedAttributes(t *testing.T) {
 		})
 	}
 }
+
+// A target's own OTEL_RESOURCE_ATTRIBUTES, and any attribute a caller passes, rank below
+// the container and Kubernetes keys OBI resolved on the trace resource.
+func TestGenerateTracesWithAttributes_ResolvedProvenanceWins(t *testing.T) {
+	span := &request.Span{
+		Type:   request.EventTypeHTTP,
+		Method: "GET",
+		Path:   "/",
+		Service: svc.Attrs{
+			UID:      svc.UID{Name: "frontend", Namespace: "shop", Instance: "frontend-0"},
+			Metadata: map[attr.Name]string{attr.ContainerID: "A", attr.K8sNamespaceName: "ns1"},
+			EnvVars:  map[string]string{"OTEL_RESOURCE_ATTRIBUTES": "container.id=B,k8s.namespace.name=ns2,deployment.environment=canary"},
+		},
+	}
+	cache := expirable2.NewLRU[svc.UID, []attribute.KeyValue](10, nil, 0)
+
+	traces := GenerateTracesWithAttributes(cache, &span.Service, []attribute.KeyValue{attribute.String("container.id", "C")},
+		&metadata.NodeMeta{}, []TraceSpanAndAttributes{{Span: span}}, "obi")
+
+	resource := traces.ResourceSpans().At(0).Resource().Attributes()
+	for key, want := range map[string]string{"container.id": "A", "k8s.namespace.name": "ns1", "deployment.environment": "canary"} {
+		got, ok := resource.Get(key)
+		require.True(t, ok, key)
+		assert.Equal(t, want, got.Str(), key)
+	}
+}

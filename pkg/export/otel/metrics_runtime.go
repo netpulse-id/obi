@@ -245,7 +245,7 @@ func newRuntimeMetricsReporter(
 func (r *RuntimeMetricsReporter) newMetricsInstance(service *svc.Attrs) RuntimeMetrics {
 	var resourceAttributes []attribute.KeyValue
 	if service != nil {
-		resourceAttributes = append(otelcfg.GetAppResourceAttrs(&r.nodeMeta, service), otelcfg.ResourceAttrsFromEnv(service)...)
+		resourceAttributes = otelcfg.GetAppResourceAttrs(&r.nodeMeta, service)
 		resourceAttributes = otelcfg.FilterResourceAttrs(resourceAttributes, r.selector)
 	}
 	log := r.log.With("service", service)

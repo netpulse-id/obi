@@ -246,7 +246,7 @@ func (mr *SvcGraphMetricsReporter) newSvcGraphMetricsInstance(service *svc.Attrs
 	var resourceAttributes []attribute.KeyValue
 	if service != nil {
 		log = log.With("service", service)
-		resourceAttributes = append(otelcfg.GetAppResourceAttrs(&mr.nodeMeta, service), otelcfg.ResourceAttrsFromEnv(service)...)
+		resourceAttributes = otelcfg.GetAppResourceAttrs(&mr.nodeMeta, service)
 		resourceAttributes = otelcfg.FilterResourceAttrs(resourceAttributes, mr.selector)
 	}
 	log.Debug("creating new Metrics reporter")

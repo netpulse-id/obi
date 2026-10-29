@@ -100,7 +100,7 @@ func (tr *tracesOTELReceiver) processSpans(ctx context.Context, exp tracesExport
 				continue
 			}
 
-			envResourceAttrs := otelcfg.ResourceAttrsFromEnv(&sample.Span.Service)
+			var envResourceAttrs []attribute.KeyValue
 			if tr.spanMetricsEnabled {
 				envResourceAttrs = append(envResourceAttrs, attribute.Bool(string(attr.SkipSpanMetrics.OTEL()), true))
 			}

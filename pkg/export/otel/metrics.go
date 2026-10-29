@@ -862,7 +862,7 @@ func (mr *MetricsReporter) newMetricsInstance(service *svc.Attrs) Metrics {
 	var resourceAttributes []attribute.KeyValue
 	if service != nil {
 		mlog = mlog.With("service", service)
-		resourceAttributes = append(otelcfg.GetAppResourceAttrs(&mr.nodeMeta, service), otelcfg.ResourceAttrsFromEnv(service)...)
+		resourceAttributes = otelcfg.GetAppResourceAttrs(&mr.nodeMeta, service)
 		resourceAttributes = otelcfg.FilterResourceAttrs(resourceAttributes, mr.userAttribSelection)
 	}
 	mlog.Debug("creating new Metrics reporter")
@@ -1505,7 +1505,6 @@ func (mr *MetricsReporter) resourceAttrsForService(service *svc.Attrs) []attribu
 	}
 
 	attrs = append(attrs, otelcfg.GetAppResourceAttrs(&mr.nodeMeta, service)...)
-	attrs = append(attrs, otelcfg.ResourceAttrsFromEnv(service)...)
 	return otelcfg.FilterResourceAttrs(attrs, mr.userAttribSelection)
 }
 

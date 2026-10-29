@@ -93,9 +93,9 @@ func omitFieldsForYAML(input any, omitFields map[string]struct{}) map[string]any
 	return result
 }
 
-// GetAppResourceAttrs returns the resource attributes of an instrumented target, except
-// the ones the target declares in its own OTEL_RESOURCE_ATTRIBUTES: those rank above
-// everything returned here, so callers must append them through ResourceAttrsFromEnv.
+// GetAppResourceAttrs returns the resource attributes of an instrumented target, the ones
+// the target declares in its own OTEL_RESOURCE_ATTRIBUTES included, in the precedence
+// order resourceAttrs gives them.
 func GetAppResourceAttrs(nodeMeta *metadata.NodeMeta, service *svc.Attrs, attrSelector ...attributes.Selection) []attribute.KeyValue {
 	attrs := resourceAttrs(nodeMeta, service)
 	attrs = append(attrs, semconv.ServiceInstanceID(service.UID.Instance))
@@ -144,12 +144,14 @@ func GetResourceAttrs(nodeMeta *metadata.NodeMeta, service *svc.Attrs, attrSelec
 //
 //  1. OBI's own OTEL_RESOURCE_ATTRIBUTES: deployment-wide defaults that fill only the
 //     keys nobody else declares.
-//  2. The metadata OBI resolved for that target: Kubernetes annotations, labels and
-//     object metadata, plus host and cloud metadata.
-//
-// The target's own OTEL_RESOURCE_ATTRIBUTES ranks above both and is not added here.
+//  2. The target's own OTEL_RESOURCE_ATTRIBUTES, without the keys that say where the
+//     telemetry came from (see ResourceAttrsFromEnv).
+//  3. The metadata OBI resolved for that target: Kubernetes annotations, labels and
+//     object metadata, plus host and cloud metadata. A value OBI resolved is never
+//     replaced by one the target declares.
 func resourceAttrs(nodeMeta *metadata.NodeMeta, service *svc.Attrs) []attribute.KeyValue {
 	attrs := processResourceAttrsFromEnv()
+	attrs = append(attrs, ResourceAttrsFromEnv(service)...)
 
 	attrs = append(attrs,
 		semconv.ServiceName(service.UID.Name),
@@ -598,12 +600,36 @@ func parseServiceOTELEnvVar(service *svc.Attrs, varName string, handler attribut
 	parseOTELEnvVar(envVar, handler)
 }
 
+// provenanceKeyPrefixes and provenanceKeys name the resource keys that say where the
+// telemetry came from. OBI resolves them from the kernel, the cgroup and the Kubernetes
+// API, so a target's own declaration of one is never taken.
+var (
+	provenanceKeyPrefixes = []string{"container.", "k8s.", "host.", "process."}
+	provenanceKeys        = []string{string(semconv.ServiceInstanceIDKey)}
+)
+
+// provenanceKey reports whether a resource key says where the telemetry came from.
+func provenanceKey(key string) bool {
+	if slices.Contains(provenanceKeys, key) {
+		return true
+	}
+	for _, prefix := range provenanceKeyPrefixes {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // ResourceAttrsFromEnv returns the resource attributes the instrumented target declares
-// in its own OTEL_RESOURCE_ATTRIBUTES. They are the top of the precedence order, so
-// callers must append them after the attributes from GetAppResourceAttrs.
+// in its own OTEL_RESOURCE_ATTRIBUTES, without the provenance keys. They rank below
+// the metadata OBI resolved, so GetAppResourceAttrs places them before it.
 func ResourceAttrsFromEnv(svc *svc.Attrs, attrSelector ...attributes.Selection) []attribute.KeyValue {
 	var otelResourceAttrs []attribute.KeyValue
 	apply := func(k string, v string) {
+		if provenanceKey(k) {
+			return
+		}
 		otelResourceAttrs = append(otelResourceAttrs, attribute.String(k, v))
 	}
 

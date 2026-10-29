@@ -236,8 +236,8 @@ func generateTracesWithAttributes(
 	traces := ptrace.NewTraces()
 	rs := traces.ResourceSpans().AppendEmpty()
 	rs.SetSchemaUrl(attr.OBISchemaURL)
-	resourceAttrs := TraceAppResourceAttrs(cache, nodeMeta, svc)
-	resourceAttrs = append(resourceAttrs, envResourceAttrs...)
+	// The attributes a caller passes rank below the ones OBI resolved for the target.
+	resourceAttrs := append(slices.Clone(envResourceAttrs), TraceAppResourceAttrs(cache, nodeMeta, svc)...)
 	resourceAttrs = otelcfg.FilterResourceAttrs(resourceAttrs, attrSelector)
 	resourceAttrsMap := AttrsToMap(resourceAttrs)
 	resourceAttrsMap.PutStr(string(semconv.OTelScopeNameKey), reporterName)

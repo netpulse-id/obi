@@ -2751,3 +2751,22 @@ func TestAppMetrics_UnmeasuredSpanPublishesRequestSizeOnly(t *testing.T) {
 	assert.NotContains(t, published, "http.client.response.body.size",
 		"a response nobody saw was reported as having a size")
 }
+
+// A target's own OTEL_RESOURCE_ATTRIBUTES rank below the container and Kubernetes keys
+// OBI resolved on the metric resource.
+func TestResourceAttrsForService_ResolvedProvenanceWins(t *testing.T) {
+	service := svc.Attrs{
+		UID:      svc.UID{Name: "frontend", Namespace: "shop", Instance: "frontend-0"},
+		Metadata: map[attr.Name]string{attr.ContainerID: "A", attr.K8sNamespaceName: "ns1"},
+		EnvVars:  map[string]string{"OTEL_RESOURCE_ATTRIBUTES": "container.id=B,k8s.namespace.name=ns2,deployment.environment=canary"},
+	}
+	mr := MetricsReporter{}
+
+	attrs := attribute.NewSet(mr.resourceAttrsForService(&service)...)
+
+	for key, want := range map[string]string{"container.id": "A", "k8s.namespace.name": "ns1", "deployment.environment": "canary"} {
+		got, ok := attrs.Value(attribute.Key(key))
+		require.True(t, ok, key)
+		assert.Equal(t, want, got.Emit(), key)
+	}
+}
