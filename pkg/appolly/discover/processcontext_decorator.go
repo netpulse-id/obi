@@ -48,11 +48,10 @@ func ProcessContextDecoratorProvider(
 type processEntry struct {
 	fi          *execpkg.FileInfo
 	contextInfo processcontext.Info
-	// resolved identifies the context attributes last applied, applied holds the
-	// process-context keys taken from them, and published the values this decorator wrote
-	// into the process metadata, so a later context update replaces or removes those and
-	// nothing else.
-	resolved  attribute.Distinct
+	// resolved holds the context attributes last applied, applied the process-context keys
+	// taken from them, and published the values this decorator wrote into the process
+	// metadata, so a later context update replaces or removes those and nothing else.
+	resolved  attribute.Set
 	applied   map[attr.Name]string
 	published map[attr.Name]string
 }
@@ -162,11 +161,10 @@ const (
 // of keys and values, all in one update of the metadata and the service UID. A context
 // whose attributes did not change since the last poll is not applied again.
 func (pcd *processContextDecorator) applyContext(entry *processEntry) {
-	resolved := entry.contextInfo.ResourceAttrs.Equivalent()
-	if resolved == entry.resolved {
+	if entry.contextInfo.ResourceAttrs.Equals(&entry.resolved) {
 		return
 	}
-	entry.resolved = resolved
+	entry.resolved = entry.contextInfo.ResourceAttrs
 	current := pcd.contextAttributes(entry.contextInfo)
 	if maps.Equal(current, entry.applied) {
 		return
