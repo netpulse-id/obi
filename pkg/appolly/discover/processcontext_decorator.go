@@ -14,6 +14,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 
 	"go.opentelemetry.io/obi/pkg/appolly/app"
+	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
 	execpkg "go.opentelemetry.io/obi/pkg/appolly/discover/exec"
 	"go.opentelemetry.io/obi/pkg/ebpf"
 	"go.opentelemetry.io/obi/pkg/export/attributes"
@@ -47,9 +48,11 @@ func ProcessContextDecoratorProvider(
 type processEntry struct {
 	fi          *execpkg.FileInfo
 	contextInfo processcontext.Info
-	// applied holds the process-context keys last applied, and published the values this
-	// decorator wrote into the process metadata from them, so a later context update
-	// replaces or removes those and nothing else.
+	// resolved identifies the context attributes last applied, applied holds the
+	// process-context keys taken from them, and published the values this decorator wrote
+	// into the process metadata, so a later context update replaces or removes those and
+	// nothing else.
+	resolved  attribute.Distinct
 	applied   map[attr.Name]string
 	published map[attr.Name]string
 }
@@ -156,16 +159,21 @@ const (
 // the workload's own declaration and never names its container, pod, host or instance.
 // A key the process stopped publishing is removed, a value OBI resolved is never replaced,
 // and the context is taken in key order up to maxContextKeys keys and maxContextBytes bytes
-// of keys and values, all in one metadata update.
+// of keys and values, all in one update of the metadata and the service UID. A context
+// whose attributes did not change since the last poll is not applied again.
 func (pcd *processContextDecorator) applyContext(entry *processEntry) {
+	resolved := entry.contextInfo.ResourceAttrs.Equivalent()
+	if resolved == entry.resolved {
+		return
+	}
+	entry.resolved = resolved
 	current := pcd.contextAttributes(entry.contextInfo)
 	if maps.Equal(current, entry.applied) {
 		return
 	}
 	entry.applied = current
-	fi := entry.fi
 	published := make(map[attr.Name]string, len(current))
-	fi.UpdateMetadata(func(m map[attr.Name]string) {
+	entry.fi.UpdateMetadata(func(m map[attr.Name]string, uid *svc.UID) {
 		for key, value := range entry.published {
 			if _, still := current[key]; !still && m[key] == value {
 				delete(m, key)
@@ -180,28 +188,18 @@ func (pcd *processContextDecorator) applyContext(entry *processEntry) {
 			m[key] = value
 			published[key] = value
 		}
+
+		// Populate service UID from process context attributes, but only if not
+		// already explicitly set. This allows process-level metadata to establish
+		// the service identity while preserving any explicit configuration.
+		if name, ok := published[attr.ServiceName]; ok && uid.Name == "" {
+			uid.Name = name
+		}
+		if namespace, ok := published[attr.ServiceNamespace]; ok && uid.Namespace == "" {
+			uid.Namespace = namespace
+		}
 	})
 	entry.published = published
-
-	// Populate service UID from process context attributes, but only if not
-	// already explicitly set. This allows process-level metadata to establish
-	// the service identity while preserving any explicit configuration.
-	name, setName := published[attr.ServiceName]
-	namespace, setNamespace := published[attr.ServiceNamespace]
-	if !setName && !setNamespace {
-		return
-	}
-	before := fi.ServiceAttrs().UID
-	uid := before
-	if setName && uid.Name == "" {
-		uid.Name = name
-	}
-	if setNamespace && uid.Namespace == "" {
-		uid.Namespace = namespace
-	}
-	if uid != before {
-		fi.SetUID(uid)
-	}
 }
 
 // contextAttributes returns the string attributes of a process context a process may

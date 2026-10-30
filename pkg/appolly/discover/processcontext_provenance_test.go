@@ -146,7 +146,7 @@ func TestApplyContext_ByteBoundAndReplacedKeys(t *testing.T) {
 	assert.Equal(t, "small", metadata["d"])
 	assert.Equal(t, "payments", metadata["team"])
 
-	fi.UpdateMetadata(func(m map[attr.Name]string) { m["team"] = "resolved" })
+	fi.UpdateMetadata(func(m map[attr.Name]string, _ *svc.UID) { m["team"] = "resolved" })
 	entry.contextInfo = processcontext.Info{}
 	pcd.applyContext(entry)
 	assert.Equal(t, map[attr.Name]string{"team": "resolved"}, fi.ServiceAttrs().Metadata)
@@ -187,4 +187,28 @@ func TestApplyContext_NoSpellingOfAProvenanceKey(t *testing.T) {
 	assert.Equal(t, "frontend-0", got["service.instance.id"])
 	assert.Equal(t, "payments", got["team"])
 	assert.Equal(t, "web", got["tier"])
+}
+
+// A context resolved again with the same attributes is not applied again, and the service
+// UID is filled from it once, only where it was empty.
+func TestApplyContext_AnUnchangedContextIsNotAppliedAgain(t *testing.T) {
+	fi := execpkg.New(execpkg.Init{Service: svc.Attrs{UID: svc.UID{Namespace: "explicit-ns"}}})
+	entry := &processEntry{fi: fi}
+	pcd := processContextDecorator{log: pclog()}
+	context := func() processcontext.Info {
+		return processcontext.Info{ResourceAttrs: attribute.NewSet(
+			attribute.String("service.name", "frontend"), attribute.String("service.namespace", "shop"),
+			attribute.String("team", "payments"))}
+	}
+
+	entry.contextInfo = context()
+	pcd.applyContext(entry)
+	service := fi.UnsafeServiceAttrs()
+	assert.Equal(t, svc.UID{Name: "frontend", Namespace: "explicit-ns"}, service.UID)
+	stored := fmt.Sprintf("%p", service.Metadata)
+
+	entry.contextInfo = context()
+	pcd.applyContext(entry)
+	assert.Equal(t, stored, fmt.Sprintf("%p", fi.UnsafeServiceAttrs().Metadata))
+	assert.Equal(t, "payments", fi.ServiceAttrs().Metadata["team"])
 }

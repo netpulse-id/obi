@@ -210,16 +210,16 @@ func (fi *FileInfo) SetMetadata(m map[attr.Name]string) {
 	fi.service.Metadata = m
 }
 
-// UpdateMetadata applies update to a copy of the process metadata and stores the result,
-// both under the lock, so a concurrent update is never lost.
-func (fi *FileInfo) UpdateMetadata(update func(m map[attr.Name]string)) {
+// UpdateMetadata applies update to a copy of the process metadata and to the service UID
+// and stores the result, all under the lock, so a concurrent update is never lost.
+func (fi *FileInfo) UpdateMetadata(update func(m map[attr.Name]string, uid *svc.UID)) {
 	fi.mu.Lock()
 	defer fi.mu.Unlock()
 	m := maps.Clone(fi.service.Metadata)
 	if m == nil {
 		m = map[attr.Name]string{}
 	}
-	update(m)
+	update(m, &fi.service.UID)
 	fi.service.Metadata = m
 }
 
