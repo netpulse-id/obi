@@ -22,8 +22,11 @@ var (
 	provenanceKeys        = []string{"service.instance.id"}
 )
 
-// ProvenanceKey reports whether a resource key says where the telemetry came from.
+// ProvenanceKey reports whether a resource key says where the telemetry came from. The key
+// is compared trimmed, lowercased and with '_' read as '.', so no other spelling of a
+// provenance key (k8s_namespace_name, Container.ID) is taken as a different key.
 func ProvenanceKey(key string) bool {
+	key = strings.ReplaceAll(strings.ToLower(strings.TrimSpace(key)), "_", ".")
 	if slices.Contains(provenanceKeys, key) {
 		return true
 	}

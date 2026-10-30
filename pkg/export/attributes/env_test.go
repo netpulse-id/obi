@@ -50,3 +50,22 @@ func BenchmarkParseOTELResourceVariable(b *testing.B) {
 		})
 	}
 }
+
+// Every spelling of a provenance key that folds to it is a provenance key, and a key
+// that only starts like one is not.
+func TestProvenanceKey_EverySpelling(t *testing.T) {
+	for _, key := range []string{
+		"k8s.namespace.name", "k8s_namespace_name", "k8s_namespace.name", "K8s.pod.name", "K8S_POD_NAME",
+		"container.name", "container_name", "Container.ID", "container_id", " container.id ",
+		"host.name", "host_name", "process.pid", "process_pid", "telemetry.sdk.name", "telemetry_distro_version",
+		"os.type", "os_type", "service.instance.id", "service_instance_id", "Service.Instance_Id",
+	} {
+		require.True(t, ProvenanceKey(key), key)
+	}
+	for _, key := range []string{
+		"service.name", "service_name", "service.namespace", "deployment.environment", "team",
+		"containers", "k8s", "hostname", "host", "process", "telemetry", "osname", "service.instance",
+	} {
+		require.False(t, ProvenanceKey(key), key)
+	}
+}

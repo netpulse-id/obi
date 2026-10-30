@@ -17,6 +17,8 @@ import (
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 
+	"go.opentelemetry.io/ebpf-profiler/process/processcontext"
+	"go.opentelemetry.io/otel/attribute"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	processcontextpb "go.opentelemetry.io/proto/otlp/processcontext/v1development"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
@@ -314,9 +316,10 @@ func TestProcessContextDecorator_AddAttribute_PreservesExplicitUID(t *testing.T)
 		Pid:        app.PID(os.Getpid()),
 	})
 
-	entry := &processEntry{fi: fi}
-	pcd.addAttribute(entry, attr.ServiceName, "from-context")
-	pcd.addAttribute(entry, attr.ServiceNamespace, "from-context-ns")
+	entry := &processEntry{fi: fi, contextInfo: processcontext.Info{ResourceAttrs: attribute.NewSet(
+		attribute.String(string(attr.ServiceName), "from-context"),
+		attribute.String(string(attr.ServiceNamespace), "from-context-ns"))}}
+	pcd.applyContext(entry)
 
 	attrs := fi.ServiceAttrs()
 	// Metadata gets the value from the context.
