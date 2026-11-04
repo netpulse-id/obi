@@ -656,6 +656,8 @@ static __always_inline void bpf_sock_ops_parse_hdr_cb(struct bpf_sock_ops *skops
 
     __builtin_memcpy(tp.tp.trace_id, opt.trace_id, sizeof(tp.tp.trace_id));
     __builtin_memcpy(tp.tp.span_id, opt.span_id, sizeof(tp.tp.span_id));
+    // The option carries no flags byte: a context continued from it is sampled.
+    tp.tp.flags = k_flag_sampled;
 
     connection_info_t conn = get_connection_info_ops(skops);
     sort_connection_info(&conn);
