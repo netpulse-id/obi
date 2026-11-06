@@ -6,7 +6,6 @@ package elfcap // import "go.opentelemetry.io/obi/pkg/internal/elfcap"
 
 import (
 	"debug/elf"
-	"encoding/binary"
 	"fmt"
 	"strings"
 )
@@ -18,52 +17,38 @@ const (
 	MaxTotalBytes = 256 << 20
 )
 
-// zlibHeaderLen is the length of the header of a .zdebug section: the magic ZLIB and the big endian decompressed size.
-const zlibHeaderLen = 12
+// zdebugPrefix opens the name of a section the parser inflates when its data opens with the ZLIB magic.
+const zdebugPrefix = ".zdebug"
 
-// DeclaredSize returns the size a compressed section declares it decompresses to, and whether the section is compressed.
-func DeclaredSize(s *elf.Section) (uint64, bool) {
-	if s.Type == elf.SHT_NOBITS {
-		return 0, false
-	}
-	if s.Flags&elf.SHF_COMPRESSED != 0 {
-		return s.Size, true
-	}
-	if !strings.HasPrefix(s.Name, ".zdebug") || s.ReaderAt == nil {
-		return 0, false
-	}
-	var hdr [zlibHeaderLen]byte
-	if n, _ := s.ReadAt(hdr[:], 0); n != zlibHeaderLen || string(hdr[:4]) != "ZLIB" {
-		return 0, false
-	}
-	return binary.BigEndian.Uint64(hdr[4:]), true
+// compressed reports whether the parser may inflate a section: flagged compressed, or named .zdebug.
+func compressed(s *elf.Section) bool {
+	return s.Type != elf.SHT_NOBITS && (s.Flags&elf.SHF_COMPRESSED != 0 || strings.HasPrefix(s.Name, zdebugPrefix))
 }
 
 // CheckLayout refuses a file holding a compressed section other than non-allocated debug information.
 func CheckLayout(f *elf.File) error {
 	for _, s := range f.Sections {
-		if _, compressed := DeclaredSize(s); !compressed {
-			continue
-		}
-		if !debugInformation(s.Name, s.Type, s.Flags) {
+		if compressed(s) && !debugInformation(s.Name, s.Type, s.Flags) {
 			return fmt.Errorf("compressed section %q is not debug information", s.Name)
 		}
 	}
 	return nil
 }
 
-// CheckDebug refuses a file whose compressed sections declare more than MaxSectionBytes each or MaxTotalBytes together.
+// CheckDebug refuses a file holding a .zdebug section, or whose compressed sections declare more than MaxSectionBytes each or MaxTotalBytes together.
 func CheckDebug(f *elf.File) error {
 	var total uint64
 	for _, s := range f.Sections {
-		size, compressed := DeclaredSize(s)
-		if !compressed {
+		if !compressed(s) {
 			continue
 		}
-		if size > MaxSectionBytes {
-			return fmt.Errorf("compressed section %q declares %d bytes, over %d", s.Name, size, MaxSectionBytes)
+		if strings.HasPrefix(s.Name, zdebugPrefix) {
+			return fmt.Errorf("section %q is compressed in the .zdebug form", s.Name)
 		}
-		total += size
+		if s.Size > MaxSectionBytes {
+			return fmt.Errorf("compressed section %q declares %d bytes, over %d", s.Name, s.Size, MaxSectionBytes)
+		}
+		total += s.Size
 		if total > MaxTotalBytes {
 			return fmt.Errorf("compressed sections declare over %d bytes together", MaxTotalBytes)
 		}

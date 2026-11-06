@@ -6,6 +6,7 @@ package exec // import "go.opentelemetry.io/obi/pkg/appolly/discover/exec"
 
 import (
 	"debug/elf"
+	"io"
 	"maps"
 	"strings"
 	"sync"
@@ -30,6 +31,7 @@ type Init struct {
 	CmdExePath     string
 	ProExeLinkPath string
 	ELF            *elf.File
+	ELFCloser      io.Closer
 	Pid            app.PID
 	Ppid           app.PID
 	StartTime      uint64
@@ -49,6 +51,7 @@ type FileInfo struct {
 	cmdExePath     string
 	proExeLinkPath string
 	elfFile        *elf.File
+	elfCloser      io.Closer
 	pid            app.PID
 	ppid           app.PID
 	startTime      uint64
@@ -65,6 +68,7 @@ func New(init Init) *FileInfo {
 		cmdExePath:     init.CmdExePath,
 		proExeLinkPath: init.ProExeLinkPath,
 		elfFile:        init.ELF,
+		elfCloser:      init.ELFCloser,
 		pid:            init.Pid,
 		ppid:           init.Ppid,
 		startTime:      init.StartTime,
@@ -137,6 +141,17 @@ func (fi *FileInfo) Ns() uint32             { return fi.ns }
 func (fi *FileInfo) CmdExePath() string     { return fi.cmdExePath }
 func (fi *FileInfo) ProExeLinkPath() string { return fi.proExeLinkPath }
 func (fi *FileInfo) ELF() *elf.File         { return fi.elfFile }
+
+// CloseELF closes the parsed executable and the open file it reads.
+func (fi *FileInfo) CloseELF() error {
+	if fi.elfCloser != nil {
+		return fi.elfCloser.Close()
+	}
+	if fi.elfFile != nil {
+		return fi.elfFile.Close()
+	}
+	return nil
+}
 
 func (fi *FileInfo) ExecutableName() string {
 	parts := strings.Split(fi.cmdExePath, "/")

@@ -205,3 +205,8 @@ func TestMultiOptionsWithoutRefCtrOffset(t *testing.T) {
 	assert.Nil(t, opts.RefCtrOffsets)
 	assert.Zero(t, opts.PID)
 }
+
+func TestAttachRefusesAnAddressOfZero(t *testing.T) {
+	_, err := Attach(nil, "/nonexistent", nil, Options{Addresses: []uint64{0x1000, 0}})
+	require.ErrorContains(t, err, "address 0")
+}

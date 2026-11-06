@@ -218,9 +218,7 @@ func (ta *traceAttacher) attacherLoop(_ context.Context) (swarm.RunFunc, error) 
 						nodeInjections.enqueue(*nodeTarget)
 					}
 
-					if instr.Obj.FileInfo.ELF() != nil {
-						_ = instr.Obj.FileInfo.ELF().Close()
-					}
+					_ = instr.Obj.FileInfo.CloseELF()
 				case EventDeleted:
 					if dotnetSessions != nil {
 						dotnetSessions.Remove(instr.Obj.FileInfo)

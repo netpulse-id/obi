@@ -54,7 +54,7 @@ func TestFindExecElfCapturesStartTime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = info.ELF().Close() })
+	t.Cleanup(func() { _ = info.CloseELF() })
 	if info.StartTime() == 0 {
 		t.Fatal("findExecElf did not capture the process start time")
 	}

@@ -836,7 +836,7 @@ func (i *instrumenter) usdtProbes(pid app.PID, ns uint32, p Tracer, maps []*proc
 		}
 
 		for _, probe := range probes {
-			closers, err := i.instrumentUSDTProbe(exe, instrPath, elfFile, pid, ns, maps, mappedPath, probe)
+			closers, err := i.instrumentUSDTProbe(exe, instrPath, elfFile.File, pid, ns, maps, mappedPath, probe)
 			if err != nil {
 				if probe.Required {
 					elfFile.Close()
@@ -1232,7 +1232,7 @@ func gatherOffsets(instrPath string, probes map[string][]*ebpfcommon.ProbeDesc, 
 
 	defer elfFile.Close()
 
-	return gatherOffsetsImpl(elfFile, probes, instrPath, log)
+	return gatherOffsetsImpl(elfFile.File, probes, instrPath, log)
 }
 
 func gatherOffsetsImpl(elfFile *elf.File, probes map[string][]*ebpfcommon.ProbeDesc,

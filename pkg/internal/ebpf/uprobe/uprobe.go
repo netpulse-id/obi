@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -225,11 +226,14 @@ type Options struct {
 	Return       bool
 }
 
-// Attach uses one uprobe_multi link, or perf events where the kernel refuses it with EINVAL.
+// Attach uses one uprobe_multi link, or perf events where the kernel refuses it with EINVAL, and refuses an address of 0.
 // A perf uprobe denied with EACCES is retried through tracefs.
 func Attach(exe *link.Executable, path string, prog *ebpf.Program, opts Options) (io.Closer, error) {
 	if len(opts.Addresses) == 0 {
 		return nil, errors.New("attaching uprobe: no addresses")
+	}
+	if slices.Contains(opts.Addresses, 0) {
+		return nil, errors.New("attaching uprobe: address 0")
 	}
 	if !multiSupported() {
 		return attachLegacy(exe, path, prog, opts)

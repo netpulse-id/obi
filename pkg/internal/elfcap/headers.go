@@ -54,29 +54,33 @@ func NewFile(r io.ReaderAt, size int64) (*elf.File, error) {
 	return f, nil
 }
 
-// Open opens the ELF file at path once, checks it with CheckHeaders and parses it through the same open file, then checks it with CheckLayout.
-func Open(path string) (*elf.File, error) {
+type File struct {
+	*elf.File
+	fd *os.File
+}
+
+// Close closes the parsed file and the open file it reads.
+func (f *File) Close() error {
+	return errors.Join(f.File.Close(), f.fd.Close())
+}
+
+// Open opens the ELF file at path once and parses that open file with NewFile, the returned file holding it until closed.
+func Open(path string) (*File, error) {
 	fd, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	defer fd.Close()
 	st, err := fd.Stat()
 	if err != nil {
+		_ = fd.Close()
 		return nil, err
 	}
-	if err := CheckHeaders(fd, st.Size()); err != nil {
-		return nil, err
-	}
-	f, err := elf.Open(fmt.Sprintf("/proc/self/fd/%d", fd.Fd()))
+	f, err := NewFile(fd, st.Size())
 	if err != nil {
+		_ = fd.Close()
 		return nil, err
 	}
-	if err := CheckLayout(f); err != nil {
-		_ = f.Close()
-		return nil, err
-	}
-	return f, nil
+	return &File{File: f, fd: fd}, nil
 }
 
 // scanHeaders checks the raw headers and returns the file and section headers it read.
@@ -167,7 +171,7 @@ func scanHeaders(r io.ReaderAt, size int64) ([]pin, error) {
 
 	for _, s := range sections {
 		name := sectionName(names, s.name)
-		if !rawCompressed(r, size, s, name) {
+		if !rawCompressed(s, name) {
 			continue
 		}
 		if !debugInformation(name, elf.SectionType(s.typ), elf.SectionFlag(s.flags)) {
@@ -189,22 +193,12 @@ func sectionName(names []byte, off uint64) string {
 	return string(rest)
 }
 
-// rawCompressed reports whether a section is flagged compressed or is a .zdebug section opening with the ZLIB magic.
-func rawCompressed(r io.ReaderAt, size int64, s rawSection, name string) bool {
+// rawCompressed reports whether a section is flagged compressed or named .zdebug, which the parser inflates when its data opens with the ZLIB magic.
+func rawCompressed(s rawSection, name string) bool {
 	if elf.SectionType(s.typ) == elf.SHT_NOBITS {
 		return false
 	}
-	if elf.SectionFlag(s.flags)&elf.SHF_COMPRESSED != 0 {
-		return true
-	}
-	if !strings.HasPrefix(name, ".zdebug") || s.size < zlibHeaderLen || s.offset > uint64(size)-zlibHeaderLen {
-		return false
-	}
-	var magic [4]byte
-	if _, err := r.ReadAt(magic[:], int64(s.offset)); err != nil {
-		return false
-	}
-	return string(magic[:]) == "ZLIB"
+	return elf.SectionFlag(s.flags)&elf.SHF_COMPRESSED != 0 || strings.HasPrefix(name, zdebugPrefix)
 }
 
 // debugInformation reports whether a section may be compressed: non-allocated, non-writable, non-executable debug information.

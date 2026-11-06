@@ -36,7 +36,7 @@ func TestCheckDebug_SectionOverTheBoundIsRefusedBeforeDecompression(t *testing.T
 	require.Less(t, after.TotalAlloc-before.TotalAlloc, uint64(1<<20))
 }
 
-func TestCheckDebug_ZdebugHeaderOverTheBoundIsRefused(t *testing.T) {
+func TestCheckDebug_AZdebugSectionIsRefused(t *testing.T) {
 	f := open(t, elfcaptest.Section{Name: ".zdebug_info", Type: elf.SHT_PROGBITS, Data: elfcaptest.ZlibHeader(1 << 30)})
 	require.NoError(t, CheckLayout(f))
 	require.ErrorContains(t, CheckDebug(f), ".zdebug_info")
@@ -51,7 +51,7 @@ func TestCheckDebug_SectionsOverTheTotalAreRefused(t *testing.T) {
 }
 
 func TestCheckDebug_SectionsWithinTheBoundsAreRead(t *testing.T) {
-	f := open(t, debugSection(".debug_info", 1<<20), elfcaptest.Section{Name: ".zdebug_line", Type: elf.SHT_PROGBITS, Data: elfcaptest.ZlibHeader(1 << 20)})
+	f := open(t, debugSection(".debug_info", 1<<20), debugSection(".debug_line", 1<<20))
 	require.NoError(t, CheckLayout(f))
 	require.NoError(t, CheckDebug(f))
 
@@ -76,8 +76,13 @@ func TestCheckLayout_CompressedSectionOutsideDebugInformationIsRefused(t *testin
 func TestCheckLayout_UncompressedSectionsPass(t *testing.T) {
 	f := open(t,
 		elfcaptest.Section{Name: ".data", Type: elf.SHT_PROGBITS, Flags: elf.SHF_ALLOC | elf.SHF_WRITE, Data: []byte("ZLIB\xff\xff\xff\xff\xff\xff\xff\xff")},
-		elfcaptest.Section{Name: ".zdebug_info", Type: elf.SHT_PROGBITS, Data: []byte("plain")},
+		elfcaptest.Section{Name: ".debug_info", Type: elf.SHT_PROGBITS, Data: []byte("plain")},
 	)
 	require.NoError(t, CheckLayout(f))
 	require.NoError(t, CheckDebug(f))
+}
+
+func TestCheckLayout_AZdebugSectionIsCheckedWithoutItsMagic(t *testing.T) {
+	f := open(t, elfcaptest.Section{Name: ".zdebug_data", Type: elf.SHT_PROGBITS, Flags: elf.SHF_ALLOC | elf.SHF_WRITE, Data: []byte("plain")})
+	require.ErrorContains(t, CheckLayout(f), "not debug information")
 }

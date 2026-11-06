@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -70,10 +72,10 @@ func TestNewFileAndOpen_CompressedDebugInformationIsParsed(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, f.Section(".debug_info"))
 
-	f, err = Open(writeFile(t, data))
+	opened, err := Open(writeFile(t, data))
 	require.NoError(t, err)
-	require.NotNil(t, f.Section(".debug_info"))
-	require.NoError(t, f.Close())
+	require.NotNil(t, opened.Section(".debug_info"))
+	require.NoError(t, opened.Close())
 }
 
 func TestNewFile_ExtendedSectionNumberingIsRefused(t *testing.T) {
@@ -109,4 +111,42 @@ func TestOpenExecutable_ACompressedNameTableIsRefusedBeforeTheSymbolReader(t *te
 	var err error
 	require.Less(t, allocatedBy(func() { _, err = OpenExecutable(path) }), uint64(1<<20))
 	require.ErrorContains(t, err, "compressed section name table")
+}
+
+func TestOpen_AWriterFlippingTheNameTableFlagNeverGetsItInflated(t *testing.T) {
+	const declared = 64 << 20
+	data := elfcaptest.BuildWithNameTable(elfcaptest.ZstdSection(declared))
+	flagAt := len(data) - 64 + 8 + 1
+	plain := bytes.Clone(data)
+	plain[flagAt] = 0
+	path := writeFile(t, plain)
+	w, err := os.OpenFile(path, os.O_WRONLY, 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	var stop atomic.Bool
+	var flipping sync.WaitGroup
+	flipping.Go(func() {
+		for !stop.Load() {
+			_, _ = w.WriteAt([]byte{0}, int64(flagAt))
+			_, _ = w.WriteAt([]byte{byte(elf.SHF_COMPRESSED >> 8)}, int64(flagAt))
+		}
+	})
+	var accepted, refused int
+	allocated := allocatedBy(func() {
+		for range 400 {
+			f, err := Open(path)
+			if err != nil {
+				refused++
+				continue
+			}
+			accepted++
+			_ = f.Close()
+		}
+	})
+	stop.Store(true)
+	flipping.Wait()
+	require.Positive(t, refused)
+	require.Positive(t, accepted)
+	require.Less(t, allocated, uint64(declared))
 }
