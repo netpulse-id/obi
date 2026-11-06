@@ -13,6 +13,7 @@ import (
 	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
 	"go.opentelemetry.io/obi/pkg/appolly/discover/exec"
 	"go.opentelemetry.io/obi/pkg/appolly/services"
+	"go.opentelemetry.io/obi/pkg/internal/elfcap"
 	"go.opentelemetry.io/obi/pkg/internal/procs"
 )
 
@@ -52,6 +53,9 @@ func findExecElf(p *services.ProcessInfo, svcID *svc.Attrs) (_ *exec.FileInfo, r
 			_ = elfFile.Close()
 		}
 	}()
+	if err := elfcap.CheckLayout(elfFile); err != nil {
+		return nil, fmt.Errorf("refusing ELF file in %s: %w", proExeLinkPath, err)
+	}
 
 	dev, ino, err := FindINodeForPID(p.Pid)
 	if err != nil {

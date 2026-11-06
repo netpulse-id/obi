@@ -23,6 +23,7 @@ import (
 	"github.com/prometheus/procfs"
 
 	"go.opentelemetry.io/obi/pkg/appolly/app"
+	"go.opentelemetry.io/obi/pkg/internal/elfcap"
 	"go.opentelemetry.io/obi/pkg/internal/procs"
 )
 
@@ -360,6 +361,9 @@ func openMappedELF(pid app.PID, object *procfs.ProcMap) (*mappedELF, error) {
 	if backing, err := os.Open(mapFile); err == nil {
 		parsed, parseErr := elf.NewFile(backing)
 		if parseErr == nil {
+			parseErr = elfcap.CheckLayout(parsed)
+		}
+		if parseErr == nil {
 			return &mappedELF{file: backing, elf: parsed}, nil
 		}
 		_ = backing.Close()
@@ -384,6 +388,9 @@ func openMappedELF(pid app.PID, object *procfs.ProcMap) (*mappedELF, error) {
 		return nil, fmt.Errorf("%w: mapped CPython object identity changed", errUnsupportedLayout)
 	}
 	parsed, err := elf.NewFile(backing)
+	if err == nil {
+		err = elfcap.CheckLayout(parsed)
+	}
 	if err != nil {
 		_ = backing.Close()
 		return nil, fmt.Errorf("opening verified CPython object: %w", err)

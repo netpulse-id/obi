@@ -18,6 +18,7 @@ import (
 
 	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
 	"go.opentelemetry.io/obi/pkg/ebpf"
+	"go.opentelemetry.io/obi/pkg/internal/elfcap"
 	"go.opentelemetry.io/obi/pkg/internal/netns"
 	"go.opentelemetry.io/obi/pkg/internal/procs"
 	"go.opentelemetry.io/obi/pkg/obi"
@@ -111,6 +112,11 @@ func (i *NodeInjector) Inject(ctx context.Context, target InjectionTarget) {
 		return
 	}
 	defer elfFile.Close()
+
+	if err := elfcap.CheckLayout(elfFile); err != nil {
+		i.log.Debug("refusing the NodeJS executable, skipping injection", "pid", pid, "error", err)
+		return
+	}
 
 	if reason := i.runtimeRefusal(target, elfFile); reason != "" {
 		i.log.Warn(skippingInjection, "pid", pid, "reason", reason)

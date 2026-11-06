@@ -32,6 +32,7 @@ import (
 	"go.opentelemetry.io/obi/pkg/export/imetrics"
 	"go.opentelemetry.io/obi/pkg/internal/ebpf/kprobe"
 	"go.opentelemetry.io/obi/pkg/internal/ebpf/uprobe"
+	"go.opentelemetry.io/obi/pkg/internal/elfcap"
 	"go.opentelemetry.io/obi/pkg/internal/goexec"
 	"go.opentelemetry.io/obi/pkg/internal/procs"
 )
@@ -833,6 +834,11 @@ func (i *instrumenter) usdtProbes(pid app.PID, ns uint32, p Tracer, maps []*proc
 			ilog().Debug("can't open ELF for USDT inspection", "pid", pid, "path", instrPath, "error", err)
 			continue
 		}
+		if err := elfcap.CheckLayout(elfFile); err != nil {
+			_ = elfFile.Close()
+			ilog().Debug("refusing ELF for USDT inspection", "pid", pid, "path", instrPath, "error", err)
+			continue
+		}
 
 		for _, probe := range probes {
 			closers, err := i.instrumentUSDTProbe(exe, instrPath, elfFile, pid, ns, maps, mappedPath, probe)
@@ -1230,6 +1236,10 @@ func gatherOffsets(instrPath string, probes map[string][]*ebpfcommon.ProbeDesc, 
 	}
 
 	defer elfFile.Close()
+
+	if err := elfcap.CheckLayout(elfFile); err != nil {
+		return fmt.Errorf("refusing elf file %s: %w", instrPath, err)
+	}
 
 	return gatherOffsetsImpl(elfFile, probes, instrPath, log)
 }

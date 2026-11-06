@@ -12,6 +12,7 @@ import (
 
 	"github.com/hashicorp/go-version"
 
+	"go.opentelemetry.io/obi/pkg/internal/elfcap"
 	"go.opentelemetry.io/obi/pkg/internal/procs"
 )
 
@@ -89,6 +90,10 @@ func nodeVersionFromLibNode(target InjectionTarget) (*version.Version, bool) {
 		return nil, false
 	}
 	defer libFile.Close()
+
+	if elfcap.CheckLayout(libFile) != nil {
+		return nil, false
+	}
 
 	return nodeVersionFromELF(libFile)
 }

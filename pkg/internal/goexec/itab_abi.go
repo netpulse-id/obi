@@ -15,11 +15,15 @@ import (
 
 	"go.opentelemetry.io/obi/internal/goabi"
 	"go.opentelemetry.io/obi/internal/goversion"
+	"go.opentelemetry.io/obi/pkg/internal/elfcap"
 )
 
 func loadGoRuntimeABI(ef *elf.File, targetVersion goversion.Version) (goabi.ABI, error) {
 	return resolveGoRuntimeABI(
 		func() (goabi.ABI, error) {
+			if err := elfcap.CheckDebug(ef); err != nil {
+				return goabi.ABI{}, err
+			}
 			data, err := ef.DWARF()
 			if err != nil {
 				return goabi.ABI{}, err

@@ -14,6 +14,8 @@ import (
 
 	"github.com/grafana/go-offsets-tracker/pkg/offsets"
 	"github.com/hashicorp/go-version"
+
+	"go.opentelemetry.io/obi/pkg/internal/elfcap"
 )
 
 func log() *slog.Logger {
@@ -801,7 +803,13 @@ func structMemberOffsets(elfFile *elf.File) (FieldOffsets, error) {
 	// first, try to read offsets from DWARF debug info
 	var offs FieldOffsets
 	var expected map[GoOffset]struct{}
-	dwarfData, err := elfFile.DWARF()
+	var dwarfData *dwarf.Data
+	err := elfcap.CheckDebug(elfFile)
+	if err == nil {
+		dwarfData, err = elfFile.DWARF()
+	} else {
+		log().Warn("debug information not read", "error", err)
+	}
 	if err == nil {
 		offs, expected = structMemberOffsetsFromDwarf(dwarfData)
 		if len(expected) > 0 {

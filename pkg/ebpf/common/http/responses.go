@@ -88,6 +88,9 @@ func getResponseBody(resp *http.Response) ([]byte, error) {
 	return body, readErr
 }
 
+// zstdMaxWindow is the largest zstd window a response may declare, the HTTP content coding's limit.
+const zstdMaxWindow = 8 << 20
+
 // decompressBody decompresses b according to the Content-Encoding value.
 // Mirrors what http.Transport does for gzip, extended to cover zstd, deflate
 // and brotli. Unsupported encodings are returned unchanged. Decompressed
@@ -108,7 +111,7 @@ func decompressBody(encoding string, b []byte) ([]byte, error) {
 		closeFn = func() { _ = gr.Close() }
 	case "zstd":
 		var zr *zstd.Decoder
-		zr, err = zstd.NewReader(bytes.NewReader(b))
+		zr, err = zstd.NewReader(bytes.NewReader(b), zstd.WithDecoderMaxWindow(zstdMaxWindow), zstd.WithDecoderConcurrency(1))
 		reader = zr
 		closeFn = zr.Close
 	case "deflate":
