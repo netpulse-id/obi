@@ -742,7 +742,7 @@ func (i *instrumenter) uprobes(pid app.PID, p Tracer, maps []*procfs.ProcMap) er
 			continue
 		}
 
-		libExe, err := link.OpenExecutable(m.instrPath)
+		libExe, err := elfcap.OpenExecutable(m.instrPath)
 		if err != nil {
 			log.Debug("can't open executable for inspection", "error", err)
 			continue
@@ -823,7 +823,7 @@ func (i *instrumenter) usdtProbes(pid app.PID, ns uint32, p Tracer, maps []*proc
 			continue
 		}
 
-		exe, err := link.OpenExecutable(instrPath)
+		exe, err := elfcap.OpenExecutable(instrPath)
 		if err != nil {
 			ilog().Debug("can't open executable for USDT instrumentation", "pid", pid, "path", instrPath, "error", err)
 			continue

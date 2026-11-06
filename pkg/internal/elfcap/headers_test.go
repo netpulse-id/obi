@@ -103,3 +103,10 @@ func (f *flipAfterFirstRead) ReadAt(p []byte, off int64) (int, error) {
 	}
 	return bytes.NewReader(f.data).ReadAt(p, off)
 }
+
+func TestOpenExecutable_ACompressedNameTableIsRefusedBeforeTheSymbolReader(t *testing.T) {
+	path := writeFile(t, elfcaptest.BuildWithNameTable(elfcaptest.ZstdSection(declared)))
+	var err error
+	require.Less(t, allocatedBy(func() { _, err = OpenExecutable(path) }), uint64(1<<20))
+	require.ErrorContains(t, err, "compressed section name table")
+}

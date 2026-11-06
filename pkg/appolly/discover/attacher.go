@@ -23,6 +23,7 @@ import (
 	attr "go.opentelemetry.io/obi/pkg/export/attributes/names"
 	"go.opentelemetry.io/obi/pkg/export/imetrics"
 	"go.opentelemetry.io/obi/pkg/internal/dotnet"
+	"go.opentelemetry.io/obi/pkg/internal/elfcap"
 	"go.opentelemetry.io/obi/pkg/internal/helpers/maps"
 	javaagent "go.opentelemetry.io/obi/pkg/internal/java"
 	"go.opentelemetry.io/obi/pkg/internal/nodejs"
@@ -477,7 +478,7 @@ func (ta *traceAttacher) harvestRoutes(ie *ebpf.Instrumentable, reused bool) {
 func (ta *traceAttacher) loadExecutable(ie *ebpf.Instrumentable) (*link.Executable, bool) {
 	// Instead of the executable file in the disk, we pass the /proc/<pid>/exec
 	// to allow loading it from different container/pods in containerized environments
-	exe, err := link.OpenExecutable(ie.FileInfo.ProExeLinkPath())
+	exe, err := elfcap.OpenExecutable(ie.FileInfo.ProExeLinkPath())
 	if err != nil {
 		ta.log.Debug("can't open executable. Ignoring",
 			"error", err, "pid", ie.FileInfo.Pid(), "cmd", ie.FileInfo.CmdExePath())

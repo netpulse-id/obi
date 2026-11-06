@@ -27,7 +27,6 @@ import (
 	"unsafe"
 
 	"github.com/cilium/ebpf"
-	"github.com/cilium/ebpf/link"
 	"github.com/prometheus/procfs"
 	"golang.org/x/sys/unix"
 
@@ -43,6 +42,7 @@ import (
 	"go.opentelemetry.io/obi/pkg/export/imetrics"
 	ebpfconvenience "go.opentelemetry.io/obi/pkg/internal/ebpf/convenience"
 	"go.opentelemetry.io/obi/pkg/internal/ebpf/uprobe"
+	"go.opentelemetry.io/obi/pkg/internal/elfcap"
 	"go.opentelemetry.io/obi/pkg/internal/goexec"
 	"go.opentelemetry.io/obi/pkg/internal/procs"
 	"go.opentelemetry.io/obi/pkg/obi"
@@ -1032,7 +1032,7 @@ func attachGoAutoSDKActivationProbe(
 	}
 
 	targetPath := fmt.Sprintf("/proc/self/fd/%d", target.Fd())
-	executable, err := link.OpenExecutable(targetPath)
+	executable, err := elfcap.OpenExecutable(targetPath)
 	if err != nil {
 		return nil, fmt.Errorf("opening target executable: %w", err)
 	}

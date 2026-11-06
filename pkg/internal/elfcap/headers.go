@@ -12,6 +12,8 @@ import (
 	"io"
 	"os"
 	"strings"
+
+	"github.com/cilium/ebpf/link"
 )
 
 // MaxNameTableBytes is the most the section name table of a file may hold.
@@ -226,4 +228,14 @@ func (p pinnedReader) ReadAt(b []byte, off int64) (int, error) {
 		}
 	}
 	return n, err
+}
+
+// OpenExecutable opens the ELF file at path for uprobes after Open accepts it, so the symbol reads of the returned executable parse a file the bounds passed.
+func OpenExecutable(path string) (*link.Executable, error) {
+	f, err := Open(path)
+	if err != nil {
+		return nil, err
+	}
+	_ = f.Close()
+	return link.OpenExecutable(path)
 }

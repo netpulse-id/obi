@@ -23,6 +23,7 @@ import (
 	"go.opentelemetry.io/obi/pkg/appolly/discover/exec"
 	cpythonruntime "go.opentelemetry.io/obi/pkg/internal/cpython/runtime"
 	"go.opentelemetry.io/obi/pkg/internal/ebpf/uprobe"
+	"go.opentelemetry.io/obi/pkg/internal/elfcap"
 	"go.opentelemetry.io/obi/pkg/internal/procs"
 )
 
@@ -230,7 +231,7 @@ func attachPythonRuntimeTarget(target *cpythonruntime.MetricTarget, program *ebp
 	if target == nil || program == nil || target.AttachmentPath() == "" {
 		return nil, cpythonruntime.GCCompletionProbe{}, errors.New("incomplete Python runtime metric target")
 	}
-	executable, err := link.OpenExecutable(target.AttachmentPath())
+	executable, err := elfcap.OpenExecutable(target.AttachmentPath())
 	if err != nil {
 		return nil, cpythonruntime.GCCompletionProbe{}, err
 	}
