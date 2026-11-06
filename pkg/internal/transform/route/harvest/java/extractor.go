@@ -17,9 +17,11 @@ import (
 
 const (
 	MaxJavaArchiveScanBytes int64 = 256 * 1024 * 1024
-	MaxJavaClassScanBytes   int64 = 2 * 1024 * 1024
-	MaxJavaClassesScanned         = 50_000
-	MaxJavaRoutes                 = 10_000
+	// MaxJavaArchiveDirectoryBytes bounds the central directory of an archive read.
+	MaxJavaArchiveDirectoryBytes uint64 = 16 * 1024 * 1024
+	MaxJavaClassScanBytes        int64  = 2 * 1024 * 1024
+	MaxJavaClassesScanned               = 50_000
+	MaxJavaRoutes                       = 10_000
 )
 
 type Extractor struct {
