@@ -4,7 +4,6 @@
 package discover // import "go.opentelemetry.io/obi/pkg/appolly/discover"
 
 import (
-	"debug/elf"
 	"fmt"
 	"os"
 	"syscall"
@@ -44,7 +43,7 @@ func findExecElf(p *services.ProcessInfo, svcID *svc.Attrs) (_ *exec.FileInfo, r
 	}
 	// TODO: allow overriding /proc root folder
 	proExeLinkPath := fmt.Sprintf("/proc/%d/exe", p.Pid)
-	elfFile, err := elf.Open(proExeLinkPath)
+	elfFile, err := elfcap.Open(proExeLinkPath)
 	if err != nil {
 		return nil, fmt.Errorf("can't open ELF file in %s: %w", proExeLinkPath, err)
 	}
@@ -53,9 +52,6 @@ func findExecElf(p *services.ProcessInfo, svcID *svc.Attrs) (_ *exec.FileInfo, r
 			_ = elfFile.Close()
 		}
 	}()
-	if err := elfcap.CheckLayout(elfFile); err != nil {
-		return nil, fmt.Errorf("refusing ELF file in %s: %w", proExeLinkPath, err)
-	}
 
 	dev, ino, err := FindINodeForPID(p.Pid)
 	if err != nil {

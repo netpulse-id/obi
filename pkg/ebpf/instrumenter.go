@@ -829,14 +829,9 @@ func (i *instrumenter) usdtProbes(pid app.PID, ns uint32, p Tracer, maps []*proc
 			continue
 		}
 
-		elfFile, err := elf.Open(instrPath)
+		elfFile, err := elfcap.Open(instrPath)
 		if err != nil {
 			ilog().Debug("can't open ELF for USDT inspection", "pid", pid, "path", instrPath, "error", err)
-			continue
-		}
-		if err := elfcap.CheckLayout(elfFile); err != nil {
-			_ = elfFile.Close()
-			ilog().Debug("refusing ELF for USDT inspection", "pid", pid, "path", instrPath, "error", err)
 			continue
 		}
 
@@ -1230,16 +1225,12 @@ func symbolNames(m map[string][]*ebpfcommon.ProbeDesc, matcher ebpfcommon.Symbol
 }
 
 func gatherOffsets(instrPath string, probes map[string][]*ebpfcommon.ProbeDesc, log *slog.Logger) error {
-	elfFile, err := elf.Open(instrPath)
+	elfFile, err := elfcap.Open(instrPath)
 	if err != nil {
 		return fmt.Errorf("failed to open elf file %s: %w", instrPath, err)
 	}
 
 	defer elfFile.Close()
-
-	if err := elfcap.CheckLayout(elfFile); err != nil {
-		return fmt.Errorf("refusing elf file %s: %w", instrPath, err)
-	}
 
 	return gatherOffsetsImpl(elfFile, probes, instrPath, log)
 }

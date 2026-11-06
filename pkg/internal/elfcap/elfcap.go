@@ -45,8 +45,7 @@ func CheckLayout(f *elf.File) error {
 		if _, compressed := DeclaredSize(s); !compressed {
 			continue
 		}
-		debugName := strings.HasPrefix(s.Name, ".debug_") || strings.HasPrefix(s.Name, ".zdebug_")
-		if !debugName || s.Type != elf.SHT_PROGBITS || s.Flags&(elf.SHF_ALLOC|elf.SHF_WRITE|elf.SHF_EXECINSTR) != 0 {
+		if !debugInformation(s.Name, s.Type, s.Flags) {
 			return fmt.Errorf("compressed section %q is not debug information", s.Name)
 		}
 	}

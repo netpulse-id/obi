@@ -14,6 +14,7 @@ import (
 	"github.com/prometheus/procfs"
 
 	"go.opentelemetry.io/obi/pkg/appolly/app"
+	"go.opentelemetry.io/obi/pkg/internal/elfcap"
 )
 
 func FindLibMaps(pid app.PID) ([]*procfs.ProcMap, error) {
@@ -69,7 +70,7 @@ func FindExeLoadBias(pid app.PID) (uint64, error) {
 		return 0, fmt.Errorf("readlink exe: %w", err)
 	}
 
-	exeFile, err := elf.Open(fmt.Sprintf("/proc/%d/exe", pid))
+	exeFile, err := elfcap.Open(fmt.Sprintf("/proc/%d/exe", pid))
 	if err != nil {
 		return 0, fmt.Errorf("open exe ELF: %w", err)
 	}

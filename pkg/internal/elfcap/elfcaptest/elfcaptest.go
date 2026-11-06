@@ -46,6 +46,11 @@ func ZlibHeader(declared uint64) []byte {
 
 // Build returns a 64-bit little endian x86-64 executable holding the given sections after a string table.
 func Build(sections ...Section) []byte {
+	return BuildWithNameTable(nil, sections...)
+}
+
+// BuildWithNameTable returns Build's file with the section name table flagged compressed and holding the given contents, unless they are nil.
+func BuildWithNameTable(compressedNames []byte, sections ...Section) []byte {
 	const ehsize, shentsize = 64, 64
 	shstr := []byte("\x00.shstrtab\x00")
 	names := make([]uint32, len(sections))
@@ -60,6 +65,10 @@ func Build(sections ...Section) []byte {
 		body.Write(s.Data)
 	}
 	strOff := ehsize + body.Len()
+	var strFlags elf.SectionFlag
+	if compressedNames != nil {
+		shstr, strFlags = compressedNames, elf.SHF_COMPRESSED
+	}
 	body.Write(shstr)
 	shOff := ehsize + body.Len()
 
@@ -73,7 +82,7 @@ func Build(sections ...Section) []byte {
 	_ = binary.Write(&f, binary.LittleEndian, hdr)
 	f.Write(body.Bytes())
 	_ = binary.Write(&f, binary.LittleEndian, elf.Section64{})
-	_ = binary.Write(&f, binary.LittleEndian, elf.Section64{Name: 1, Type: uint32(elf.SHT_STRTAB), Off: uint64(strOff), Size: uint64(len(shstr)), Addralign: 1})
+	_ = binary.Write(&f, binary.LittleEndian, elf.Section64{Name: 1, Type: uint32(elf.SHT_STRTAB), Flags: uint64(strFlags), Off: uint64(strOff), Size: uint64(len(shstr)), Addralign: 1})
 	for i, s := range sections {
 		_ = binary.Write(&f, binary.LittleEndian, elf.Section64{
 			Name: names[i], Type: uint32(s.Type), Flags: uint64(s.Flags),

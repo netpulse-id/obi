@@ -359,10 +359,7 @@ type mappedELF struct {
 func openMappedELF(pid app.PID, object *procfs.ProcMap) (*mappedELF, error) {
 	mapFile := fmt.Sprintf("/proc/%d/map_files/%x-%x", pid, object.StartAddr, object.EndAddr)
 	if backing, err := os.Open(mapFile); err == nil {
-		parsed, parseErr := elf.NewFile(backing)
-		if parseErr == nil {
-			parseErr = elfcap.CheckLayout(parsed)
-		}
+		parsed, parseErr := openedELF(backing)
 		if parseErr == nil {
 			return &mappedELF{file: backing, elf: parsed}, nil
 		}
@@ -387,10 +384,7 @@ func openMappedELF(pid app.PID, object *procfs.ProcMap) (*mappedELF, error) {
 		_ = backing.Close()
 		return nil, fmt.Errorf("%w: mapped CPython object identity changed", errUnsupportedLayout)
 	}
-	parsed, err := elf.NewFile(backing)
-	if err == nil {
-		err = elfcap.CheckLayout(parsed)
-	}
+	parsed, err := openedELF(backing)
 	if err != nil {
 		_ = backing.Close()
 		return nil, fmt.Errorf("opening verified CPython object: %w", err)
@@ -461,4 +455,13 @@ func checkedAddress(base, offset uint64) (uint64, error) {
 		return 0, errUnsupportedLayout
 	}
 	return address, nil
+}
+
+// openedELF parses an open ELF file after the bounds of elfcap.NewFile.
+func openedELF(f *os.File) (*elf.File, error) {
+	st, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	return elfcap.NewFile(f, st.Size())
 }

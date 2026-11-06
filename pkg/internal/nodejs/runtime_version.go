@@ -85,15 +85,11 @@ func nodeVersionFromLibNode(target InjectionTarget) (*version.Version, bool) {
 	}
 	defer lib.Close()
 
-	libFile, err := elf.NewFile(lib)
+	libFile, err := newELFFile(lib)
 	if err != nil {
 		return nil, false
 	}
 	defer libFile.Close()
-
-	if elfcap.CheckLayout(libFile) != nil {
-		return nil, false
-	}
 
 	return nodeVersionFromELF(libFile)
 }
@@ -146,4 +142,13 @@ func nodeVersionFrom(rodata []byte) (*version.Version, bool) {
 	}
 
 	return nodeVersion, true
+}
+
+// newELFFile parses an open ELF file after the bounds of elfcap.NewFile.
+func newELFFile(f *os.File) (*elf.File, error) {
+	st, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	return elfcap.NewFile(f, st.Size())
 }
