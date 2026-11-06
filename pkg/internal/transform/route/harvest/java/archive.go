@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 )
 
 func (e *Extractor) scanDir(ctx context.Context, root string) error {
@@ -113,7 +114,13 @@ func (e *Extractor) scanArchive(ctx context.Context, path string) error {
 		e.log.Info("java archive directory limit reached", "path", path, "size", directory, "limit", MaxJavaArchiveDirectoryBytes)
 		return nil
 	}
-	reader, err := zip.NewReader(archive, info.Size())
+	budget := newReadBudget(archive, int64(MaxJavaArchiveDirectoryBytes)+zipEndReadSlack)
+	reader, err := zip.NewReader(budget, info.Size())
+	budget.lift()
+	if errors.Is(err, errReadBudget) {
+		e.log.Info("java archive directory limit reached", "path", path, "limit", MaxJavaArchiveDirectoryBytes)
+		return nil
+	}
 	if err != nil {
 		e.log.Debug("error opening Java archive", "path", path, "error", err)
 		return nil
@@ -252,4 +259,34 @@ func centralDirectorySize(r io.ReaderAt, size int64) (uint64, error) {
 		return 0, errors.New("no zip64 end of central directory record")
 	}
 	return binary.LittleEndian.Uint64(record[zip64DirectorySizeAt:]), nil
+}
+
+// zipEndReadSlack is what the reader may read past the central directory while it finds the end records.
+const zipEndReadSlack = 128 << 10
+
+var errReadBudget = errors.New("archive read past its budget")
+
+type readBudget struct {
+	r      io.ReaderAt
+	left   atomic.Int64
+	lifted atomic.Bool
+}
+
+func newReadBudget(r io.ReaderAt, budget int64) *readBudget {
+	b := &readBudget{r: r}
+	b.left.Store(budget)
+	return b
+}
+
+// ReadAt reads from the archive, refusing a read that passes the budget until the budget is lifted.
+func (b *readBudget) ReadAt(p []byte, off int64) (int, error) {
+	if !b.lifted.Load() && b.left.Add(-int64(len(p))) < 0 {
+		return 0, errReadBudget
+	}
+	return b.r.ReadAt(p, off)
+}
+
+// lift ends the budget, so the entries are read without it.
+func (b *readBudget) lift() {
+	b.lifted.Store(true)
 }

@@ -27,22 +27,25 @@ func endRecord(records uint16, size, offset uint32) []byte {
 	return b
 }
 
-// directoryBomb returns an archive of n central directory records with no entry data.
-func directoryBomb(n int) []byte {
+// directoryBomb returns an archive of n central directory records with no entry data, its end record naming the directory's size or 0.
+func directoryBomb(n int, declareSize bool) []byte {
 	var b bytes.Buffer
 	record := make([]byte, 46)
 	copy(record, "PK\x01\x02")
 	for range n {
 		b.Write(record)
 	}
-	size := b.Len()
-	b.Write(endRecord(0xffff, uint32(size), 0))
+	size := uint32(0)
+	if declareSize {
+		size = uint32(b.Len())
+	}
+	b.Write(endRecord(uint16(n), size, 0))
 	return b.Bytes()
 }
 
 func TestScanArchive_ADirectoryOverTheBoundIsNotParsed(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "app.jar")
-	require.NoError(t, os.WriteFile(path, directoryBomb(400_000), 0o600))
+	require.NoError(t, os.WriteFile(path, directoryBomb(400_000, true), 0o600))
 
 	extractor := NewExtractor()
 	var before, after runtime.MemStats
@@ -87,4 +90,31 @@ func TestCentralDirectorySize_AWrittenArchiveIsRead(t *testing.T) {
 	size, err := centralDirectorySize(bytes.NewReader(data), int64(len(data)))
 	require.NoError(t, err)
 	assert.Equal(t, uint64(46+len("com/example/A.class")), size)
+}
+
+func TestScanArchive_ADirectoryDeclaredEmptyIsReadOnlyWithinTheBound(t *testing.T) {
+	const records = 1_500_000
+	path := filepath.Join(t.TempDir(), "app.jar")
+	require.NoError(t, os.WriteFile(path, directoryBomb(records, false), 0o600))
+
+	extractor := NewExtractor()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	require.NoError(t, extractor.scanArchive(context.Background(), path))
+	runtime.ReadMemStats(&after)
+
+	assert.Less(t, after.TotalAlloc-before.TotalAlloc, uint64(160<<20))
+	assert.Zero(t, extractor.classesScanned)
+}
+
+func TestReadBudget_AReadPastTheBudgetIsRefusedUntilLifted(t *testing.T) {
+	b := newReadBudget(bytes.NewReader(make([]byte, 64)), 32)
+	buf := make([]byte, 24)
+	_, err := b.ReadAt(buf, 0)
+	require.NoError(t, err)
+	_, err = b.ReadAt(buf, 24)
+	require.ErrorIs(t, err, errReadBudget)
+	b.lift()
+	_, err = b.ReadAt(buf, 24)
+	require.NoError(t, err)
 }
