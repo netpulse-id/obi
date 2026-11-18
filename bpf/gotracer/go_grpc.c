@@ -572,7 +572,46 @@ static __always_inline void cleanup_grpc_request_refs(const go_addr_key_t *reque
     bpf_map_delete_elem(&grpc_owned_stream_by_request, request_key);
 }
 
-static __always_inline int grpc_connect_done(struct pt_regs *ctx, void *err) {
+// Returns the code of a gRPC status error from its data word, Unknown when the chain does not read as one.
+static __always_inline u16 grpc_client_error_code(void *err_data) {
+    const u16 code_unknown = 2;
+    const u32 code_max = 16;
+
+    if (!err_data) {
+        return code_unknown;
+    }
+
+    off_table_t *ot = get_offsets_table();
+    const u64 s_pos = go_offset_of(ot, (go_offset){.v = _grpc_status_s_pos});
+    const u64 code_pos = go_offset_of(ot, (go_offset){.v = _grpc_status_code_ptr_pos});
+    if (s_pos == (u64)-1 || code_pos == (u64)-1) {
+        return code_unknown;
+    }
+
+    // The data word points at internal/status.Error, whose first field is its *Status.
+    void *status_ptr = NULL;
+    if (bpf_probe_read_user(&status_ptr, sizeof(status_ptr), err_data) || !status_ptr) {
+        return code_unknown;
+    }
+
+    void *s_ptr = NULL;
+    if (bpf_probe_read_user(&s_ptr, sizeof(s_ptr), status_ptr + s_pos) || !s_ptr) {
+        return code_unknown;
+    }
+
+    u32 code = 0;
+    if (bpf_probe_read_user(&code, sizeof(code), s_ptr + code_pos)) {
+        return code_unknown;
+    }
+    bpf_dbg_printk("grpc client status code=%d", code);
+
+    if (code == 0 || code > code_max) {
+        return code_unknown;
+    }
+    return (u16)code;
+}
+
+static __always_inline int grpc_connect_done(struct pt_regs *ctx, u16 status) {
     void *goroutine_addr = GOROUTINE_PTR(ctx);
     bpf_dbg_printk("goroutine_addr=%lx", goroutine_addr);
     go_addr_key_t g_key = {};
@@ -632,10 +671,7 @@ static __always_inline int grpc_connect_done(struct pt_regs *ctx, void *err) {
 
     trace->tp = invocation->tp;
 
-    trace->status =
-        (err)
-            ? 2
-            : 0; // Getting the gRPC client status is complex, if there's an error we set Code.Unknown = 2
+    trace->status = status;
 
     // submit the completed trace via ringbuffer
     bpf_ringbuf_submit(trace, get_flags());
@@ -654,7 +690,7 @@ int GUARDED_PROG(obi_uprobe_ClientConn_NewStream_return, struct pt_regs *, ctx) 
     void *stream = GO_PARAM1(ctx);
 
     if (!stream) {
-        return grpc_connect_done(ctx, (void *)1);
+        return grpc_connect_done(ctx, grpc_client_error_code(GO_PARAM4(ctx)));
     }
 
     return 0;
@@ -691,7 +727,7 @@ int GUARDED_PROG(obi_uprobe_ClientConn_Invoke_return, struct pt_regs *, ctx) {
     void *err = GO_PARAM1(ctx);
 
     if (err) {
-        return grpc_connect_done(ctx, err);
+        return grpc_connect_done(ctx, grpc_client_error_code(GO_PARAM2(ctx)));
     }
 
     return 0;
@@ -702,7 +738,7 @@ SEC("uprobe/clientStream_RecvMsg")
 int GUARDED_PROG(obi_uprobe_clientStream_RecvMsg_return, struct pt_regs *, ctx) {
     bpf_dbg_printk("=== uprobe/clientStream_RecvMsg ===");
     void *err = (void *)GO_PARAM1(ctx);
-    return grpc_connect_done(ctx, err);
+    return grpc_connect_done(ctx, err ? grpc_client_error_code(GO_PARAM2(ctx)) : 0);
 }
 
 // The gRPC client stream is written on another goroutine in transport loopyWriter (controlbuf.go).
