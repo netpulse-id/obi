@@ -214,7 +214,7 @@ func (e *obiTracesExporter) runQueue(ctx context.Context) {
 		workers.Go(func() {
 			for batch := range batches {
 				if err := e.export(ctx, batch); err != nil {
-					slog.Warn("error sending trace to consumer", "error", err, "spans", batch.SpanCount())
+					slog.Warn("error sending trace to consumer", "spans", batch.SpanCount(), "error", err)
 				}
 			}
 		})
