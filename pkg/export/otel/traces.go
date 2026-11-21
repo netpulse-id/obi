@@ -119,9 +119,9 @@ func (tr *tracesOTELReceiver) processSpans(ctx context.Context, exp tracesExport
 				if err.Error() == "sending queue is full" {
 					// TODO: set this condition case to Warn once we make sure that
 					// queueConfig.BlockOnOverflow = true works as expected
-					slog.Debug("error sending trace to consumer", "error", err)
+					slog.Debug("error sending trace to consumer", "error", err, "spans", traces.SpanCount())
 				} else {
-					slog.Warn("error sending trace to consumer", "error", err)
+					slog.Warn("error sending trace to consumer", "error", err, "spans", traces.SpanCount())
 				}
 			}
 		}
