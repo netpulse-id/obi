@@ -73,12 +73,10 @@ func (s *Stats) buildPipeline(ctx context.Context) (*swarm.Runner, error) {
 		swarm.WithID("StatsDecorator"))
 
 	dynamicFilteredStats := msgh.QueueFromConfig[[]*ebpf.Stat](s.cfg, s.ctxInfo.Metrics, "dynamicFilteredStats")
+	// Connection stats stay host-wide: the dynamic selection neither decorates nor filters them.
 	var dynamicSelector selection.PIDSelector
-	if s.ctxInfo.DynamicSelector != nil {
-		dynamicSelector = s.ctxInfo.DynamicSelector.StatsMetrics()
-	}
 	dynamicDecoratedStats := msgh.QueueFromConfig[[]*ebpf.Stat](s.cfg, s.ctxInfo.Metrics, "dynamicDecoratedStats")
-	swi.Add(dynamicpid.MetadataDecoratorProvider(s.ctxInfo.DynamicSelector, dynamicSelector,
+	swi.Add(dynamicpid.MetadataDecoratorProvider(nil, dynamicSelector,
 		s.ctxInfo.K8sInformer, statAttrs, decoratedStats, dynamicDecoratedStats),
 		swarm.WithID("DynamicPIDMetadataDecorator"))
 	swi.Add(filter.ByDynamicPID("stats", dynamicSelector, s.ctxInfo.K8sInformer,
