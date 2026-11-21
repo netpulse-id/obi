@@ -16,6 +16,11 @@ import (
 	"go.opentelemetry.io/obi/pkg/selection"
 )
 
+// selectedBy reports whether a view names the process itself or the selected process it was matched through.
+func selectedBy(selector selection.PIDSelector, own, owner app.PID) bool {
+	return selector.IncludesPID(owner) || (own != 0 && own != owner && selector.IncludesPID(own))
+}
+
 func dynamicSignalPID(service *request.Span) app.PID {
 	if service.Service.DynamicSelectorPID != 0 {
 		return service.Service.DynamicSelectorPID
@@ -54,11 +59,11 @@ func DynamicSignalSpanGate(
 			defer output.Close()
 			swarms.ForEachInput(ctx, in, nil, func(spans []request.Span) {
 				for i := range spans {
-					pid := dynamicSignalPID(&spans[i])
-					if !tracesSelector.IncludesPID(pid) {
+					pid, own := dynamicSignalPID(&spans[i]), spans[i].Pid.HostPID
+					if !selectedBy(tracesSelector, own, pid) {
 						request.SetIgnoreTraces(&spans[i])
 					}
-					if !metricsSelector.IncludesPID(pid) {
+					if !selectedBy(metricsSelector, own, pid) {
 						request.SetIgnoreMetrics(&spans[i])
 					}
 				}
@@ -99,7 +104,7 @@ func filterRuntimeMetricSnapshots(
 	writeIdx := 0
 	for readIdx := range snapshots {
 		// Tombstones bypass PID selection so exporters can remove previously exported series.
-		if snapshots[readIdx].Removed || selector.IncludesPID(runtimeMetricSignalPID(snapshots[readIdx])) {
+		if snapshots[readIdx].Removed || selectedBy(selector, snapshots[readIdx].PID, runtimeMetricSignalPID(snapshots[readIdx])) {
 			snapshots[writeIdx] = snapshots[readIdx]
 			writeIdx++
 		}
@@ -175,7 +180,7 @@ func (g *dynamicSignalProcessEventGate) handleProcessEvent(pe exec.ProcessEvent)
 		if g.forwarded[pid] {
 			return
 		}
-		if g.selector.IncludesPID(processEventSignalPID(pe)) {
+		if selectedBy(g.selector, pid, processEventSignalPID(pe)) {
 			g.forwarded[pid] = true
 			g.output.Send(pe)
 		}
@@ -194,7 +199,7 @@ func (g *dynamicSignalProcessEventGate) handleSelectorAdd(added []app.PID) {
 	}
 	for _, signalPID := range added {
 		for pid, file := range g.current {
-			if g.forwarded[pid] || processEventSignalPID(exec.ProcessEvent{File: file}) != signalPID {
+			if g.forwarded[pid] || (pid != signalPID && processEventSignalPID(exec.ProcessEvent{File: file}) != signalPID) {
 				continue
 			}
 			g.forwarded[pid] = true
@@ -209,7 +214,10 @@ func (g *dynamicSignalProcessEventGate) handleSelectorRemove(removed []app.PID) 
 	}
 	for _, signalPID := range removed {
 		for pid, file := range g.current {
-			if !g.forwarded[pid] || processEventSignalPID(exec.ProcessEvent{File: file}) != signalPID {
+			if !g.forwarded[pid] || (pid != signalPID && processEventSignalPID(exec.ProcessEvent{File: file}) != signalPID) {
+				continue
+			}
+			if selectedBy(g.selector, pid, processEventSignalPID(exec.ProcessEvent{File: file})) {
 				continue
 			}
 			g.forwarded[pid] = false

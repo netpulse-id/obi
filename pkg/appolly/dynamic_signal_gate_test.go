@@ -307,3 +307,72 @@ func TestDynamicSignalSpanGate_BypassWhenSelectorNil(t *testing.T) {
 	input.Send([]request.Span{{Service: svc.Attrs{ProcPID: 1}}})
 	time.Sleep(50 * time.Millisecond)
 }
+
+func TestDynamicSignalSpanGate_ASelectedProcessKeepsItsSignalsAfterItsOwnerLeaves(t *testing.T) {
+	sel := discover.NewDynamicSelector()
+	sel.AddPIDs(5)
+
+	input := msg.NewQueue[[]request.Span](msg.ChannelBufferLen(4))
+	output := msg.NewQueue[[]request.Span](msg.ChannelBufferLen(4))
+	outCh := output.Subscribe()
+
+	runFn, err := DynamicSignalSpanGate(sel, input, output)(t.Context())
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go runFn(ctx)
+
+	input.Send([]request.Span{
+		{Service: svc.Attrs{ProcPID: 5, DynamicSelectorPID: 1}, Pid: request.PidInfo{HostPID: 5}},
+		{Service: svc.Attrs{ProcPID: 6, DynamicSelectorPID: 1}, Pid: request.PidInfo{HostPID: 6}},
+	})
+
+	got := testutil.ReadChannel(t, outCh, gateTestTimeout)
+	require.Len(t, got, 2)
+	assert.False(t, request.IgnoreTraces(&got[0]))
+	assert.False(t, request.IgnoreMetrics(&got[0]))
+	assert.True(t, request.IgnoreTraces(&got[1]))
+	assert.True(t, request.IgnoreMetrics(&got[1]))
+}
+
+func TestDynamicSignalProcessEventGate_ASelectedProcessOutlivesItsOwner(t *testing.T) {
+	sel := discover.NewDynamicSelector()
+	sel.AddPIDs(1)
+
+	input := msg.NewQueue[execpkg.ProcessEvent](msg.ChannelBufferLen(8))
+	output := msg.NewQueue[execpkg.ProcessEvent](msg.ChannelBufferLen(8))
+	outCh := output.Subscribe()
+
+	runFn, err := DynamicSignalProcessEventGate(sel, input, output)(t.Context())
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go runFn(ctx)
+
+	child := execpkg.New(execpkg.Init{Service: svc.Attrs{ProcPID: 5, DynamicSelectorPID: 1}, Pid: 5})
+	input.Send(execpkg.ProcessEvent{Type: execpkg.ProcessEventCreated, File: child})
+	got := testutil.ReadChannel(t, outCh, gateTestTimeout)
+	assert.Equal(t, execpkg.ProcessEventCreated, got.Type)
+
+	sel.AddPIDs(5)
+	sel.RemovePIDs(1)
+	testutil.ChannelEmpty(t, outCh, 100*time.Millisecond)
+
+	sel.RemovePIDs(5)
+	got = testutil.ReadChannel(t, outCh, gateTestTimeout)
+	assert.Equal(t, execpkg.ProcessEventTerminated, got.Type)
+	assert.Equal(t, app.PID(5), got.File.Pid())
+}
+
+func TestDynamicSignalRuntimeMetricsGate_ASelectedProcessOutlivesItsOwner(t *testing.T) {
+	sel := discover.NewDynamicSelector()
+	sel.AddPIDs(5)
+
+	got := filterRuntimeMetricSnapshots([]runtimemetrics.RuntimeMetricSnapshot{
+		{PID: 5, Service: svc.Attrs{DynamicSelectorPID: 1}},
+		{PID: 6, Service: svc.Attrs{DynamicSelectorPID: 1}},
+	}, sel.AppMetrics())
+
+	require.Len(t, got, 1)
+	assert.Equal(t, app.PID(5), got[0].PID)
+}
