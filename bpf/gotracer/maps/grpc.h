@@ -35,13 +35,6 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __type(key, go_addr_key_t); // key: pid + pointer to the transport
-    __type(value, grpc_connection_t);
-    __uint(max_entries, MAX_CONCURRENT_REQUESTS);
-} cached_grpc_client_connections SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __type(key, grpc_stream_key_t);               // key: pid + conn_ptr + stream id
     __type(value, grpc_client_func_invocation_t); // stored info for the client request
     __uint(max_entries, MAX_CONCURRENT_REQUESTS);

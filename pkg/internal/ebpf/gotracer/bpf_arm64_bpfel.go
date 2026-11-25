@@ -814,7 +814,6 @@ const (
 	BpfMapActiveUnixSocks                                         = "active_unix_socks"
 	BpfMapAerospikeState                                          = "aerospike_state"
 	BpfMapBufferedChannelSenders                                  = "buffered_channel_senders"
-	BpfMapCachedGrpcClientConnections                             = "cached_grpc_client_connections"
 	BpfMapChanrecvInvocations                                     = "chanrecv_invocations"
 	BpfMapChansendInvocations                                     = "chansend_invocations"
 	BpfMapCloneMap                                                = "clone_map"
@@ -1340,7 +1339,6 @@ type BpfMapSpecs struct {
 	ActiveUnixSocks                *ebpf.MapSpec `ebpf:"active_unix_socks"`
 	AerospikeState                 *ebpf.MapSpec `ebpf:"aerospike_state"`
 	BufferedChannelSenders         *ebpf.MapSpec `ebpf:"buffered_channel_senders"`
-	CachedGrpcClientConnections    *ebpf.MapSpec `ebpf:"cached_grpc_client_connections"`
 	ChanrecvInvocations            *ebpf.MapSpec `ebpf:"chanrecv_invocations"`
 	ChansendInvocations            *ebpf.MapSpec `ebpf:"chansend_invocations"`
 	CloneMap                       *ebpf.MapSpec `ebpf:"clone_map"`
@@ -1552,7 +1550,6 @@ type BpfMaps struct {
 	ActiveUnixSocks                *ebpf.Map `ebpf:"active_unix_socks"`
 	AerospikeState                 *ebpf.Map `ebpf:"aerospike_state"`
 	BufferedChannelSenders         *ebpf.Map `ebpf:"buffered_channel_senders"`
-	CachedGrpcClientConnections    *ebpf.Map `ebpf:"cached_grpc_client_connections"`
 	ChanrecvInvocations            *ebpf.Map `ebpf:"chanrecv_invocations"`
 	ChansendInvocations            *ebpf.Map `ebpf:"chansend_invocations"`
 	CloneMap                       *ebpf.Map `ebpf:"clone_map"`
@@ -1697,7 +1694,6 @@ func (m *BpfMaps) Close() error {
 		m.ActiveUnixSocks,
 		m.AerospikeState,
 		m.BufferedChannelSenders,
-		m.CachedGrpcClientConnections,
 		m.ChanrecvInvocations,
 		m.ChansendInvocations,
 		m.CloneMap,

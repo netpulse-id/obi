@@ -679,6 +679,7 @@ static __always_inline int grpc_connect_done(struct pt_regs *ctx, u16 status) {
 done:
     go_obi_ctx__end(&g_key, k_obi_ctx_grpc_client, invocation ? &invocation->tp : NULL);
     bpf_map_delete_elem(&ongoing_grpc_client_requests, &g_key);
+    bpf_map_delete_elem(&ongoing_client_connections, &g_key);
     return 0;
 }
 
@@ -767,68 +768,56 @@ int GUARDED_PROG(obi_uprobe_transport_http2Client_NewStream, struct pt_regs *, c
             bpf_probe_read(&conn_ptr_key, sizeof(conn_ptr_key), conn_ptr);
         }
 
-        // PID-scoped cache key: uses the transport pointer as the address
-        // component to avoid stale entries when pointer values are recycled
-        // across different processes.
-        go_addr_key_t cache_key = {};
-        go_addr_key_from_id(&cache_key, t_ptr);
+        // Reads the transport's connection on every stream.
+        void *s_ptr = 0;
+        buf[0] = 0;
+        bpf_probe_read(&s_ptr, sizeof(s_ptr), (void *)(t_ptr + grpc_t_conn_pos));
+        bpf_probe_read(buf, sizeof(buf), s_ptr);
 
-        grpc_connection_t *cached_conn =
-            bpf_map_lookup_elem(&cached_grpc_client_connections, &cache_key);
-        // reading the connection can be expensive for high volume of
-        // new grpc client connections. We cache it, since most grpc client
-        // connections are long lived.
-        if (!cached_conn) {
-            void *s_ptr = 0;
-            buf[0] = 0;
-            bpf_probe_read(&s_ptr, sizeof(s_ptr), (void *)(t_ptr + grpc_t_conn_pos));
-            bpf_probe_read(buf, sizeof(buf), s_ptr);
+        //bpf_dbg_printk("scheme=%s", buf);
 
-            //bpf_dbg_printk("scheme=%s", buf);
+        if (buf[0] == 'h' && buf[1] == 't' && buf[2] == 't' && buf[3] == 'p' && buf[4] == 's') {
+            is_secure = 1;
+        }
 
-            if (buf[0] == 'h' && buf[1] == 't' && buf[2] == 't' && buf[3] == 'p' && buf[4] == 's') {
-                is_secure = 1;
-            }
+        if (is_secure) {
+            // double wrapped in grpc
+            conn_ptr = unwrap_tls_conn_info(conn_ptr, (void *)is_secure);
+            conn_ptr = unwrap_tls_conn_info(conn_ptr, (void *)is_secure);
+        }
+        bpf_dbg_printk("conn_ptr=%llx, is_secure=%lld", conn_ptr, is_secure);
+        u8 ok = 0;
+        if (conn_ptr) {
+            void *conn_conn_ptr = 0;
+            bpf_probe_read(&conn_conn_ptr, sizeof(conn_conn_ptr), conn_ptr);
+            bpf_dbg_printk("conn_conn_ptr=%llx", conn_conn_ptr);
+            if (conn_conn_ptr) {
+                grpc_connection_t grpc_conn = {
+                    .pid = pid_from_pid_tgid(bpf_get_current_pid_tgid()),
+                };
+                ok = get_conn_info(conn_conn_ptr, &grpc_conn.conn);
+                if (ok) {
+                    socket_cookie_from_go_fd(fd_ptr_from_conn(conn_conn_ptr),
+                                             &grpc_conn.socket_cookie);
+                    bpf_map_update_elem(
+                        &ongoing_client_connections, &g_key, &grpc_conn.conn, BPF_ANY);
 
-            if (is_secure) {
-                // double wrapped in grpc
-                conn_ptr = unwrap_tls_conn_info(conn_ptr, (void *)is_secure);
-                conn_ptr = unwrap_tls_conn_info(conn_ptr, (void *)is_secure);
-            }
-            bpf_dbg_printk("conn_ptr=%llx, is_secure=%lld", conn_ptr, is_secure);
-            if (conn_ptr) {
-                void *conn_conn_ptr = 0;
-                bpf_probe_read(&conn_conn_ptr, sizeof(conn_conn_ptr), conn_ptr);
-                bpf_dbg_printk("conn_conn_ptr=%llx", conn_conn_ptr);
-                if (conn_conn_ptr) {
-                    grpc_connection_t grpc_conn = {
-                        .pid = pid_from_pid_tgid(bpf_get_current_pid_tgid()),
-                    };
-                    const u8 ok = get_conn_info(conn_conn_ptr, &grpc_conn.conn);
-                    if (ok) {
-                        socket_cookie_from_go_fd(fd_ptr_from_conn(conn_conn_ptr),
-                                                 &grpc_conn.socket_cookie);
+                    if (conn_ptr_key) {
+                        go_addr_key_t conn_key = {};
+                        go_addr_key_from_id(&conn_key, conn_ptr_key);
                         bpf_map_update_elem(
-                            &ongoing_client_connections, &g_key, &grpc_conn.conn, BPF_ANY);
-                        bpf_map_update_elem(
-                            &cached_grpc_client_connections, &cache_key, &grpc_conn, BPF_ANY);
-
-                        if (conn_ptr_key) {
-                            go_addr_key_t conn_key = {};
-                            go_addr_key_from_id(&conn_key, conn_ptr_key);
-                            bpf_map_update_elem(
-                                &grpc_conn_ptr_to_conn, &conn_key, &grpc_conn, BPF_ANY);
-                        }
+                            &grpc_conn_ptr_to_conn, &conn_key, &grpc_conn, BPF_ANY);
                     }
                 }
             }
-        } else {
-            bpf_map_update_elem(&ongoing_client_connections, &g_key, &cached_conn->conn, BPF_ANY);
-
+        }
+        // A stream whose connection cannot be read carries none, never an earlier stream's.
+        if (!ok) {
+            bpf_map_delete_elem(&ongoing_client_connections, &g_key);
             if (conn_ptr_key) {
                 go_addr_key_t conn_key = {};
                 go_addr_key_from_id(&conn_key, conn_ptr_key);
-                bpf_map_update_elem(&grpc_conn_ptr_to_conn, &conn_key, cached_conn, BPF_ANY);
+                bpf_map_delete_elem(&grpc_conn_ptr_to_conn, &conn_key);
             }
         }
 
