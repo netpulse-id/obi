@@ -26,6 +26,49 @@ const (
 	serviceNamespaceKey = "service.namespace"
 )
 
+// keptEnvNames names the process environment variables a reader of FileInfo looks up
+var keptEnvNames = map[string]struct{}{
+	envServiceName:                        {},
+	envResourceAttrs:                      {},
+	"OTEL_EXPORTER_OTLP_PROTOCOL":         {},
+	"OTEL_EXPORTER_OTLP_TRACES_PROTOCOL":  {},
+	"OTEL_EXPORTER_OTLP_METRICS_PROTOCOL": {},
+	"OTEL_EXPORTER_OTLP_ENDPOINT":         {},
+	"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT":  {},
+	"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": {},
+	"TMPDIR":                              {},
+	"CLASSPATH":                           {},
+	"SPRING_APPLICATION_NAME":             {},
+	"npm_package_json":                    {},
+	"DENO_NO_PACKAGE_JSON":                {},
+	"PYTHONPATH":                          {},
+	"PYTHONSAFEPATH":                      {},
+	"DJANGO_SETTINGS_MODULE":              {},
+	"FLASK_APP":                           {},
+	"CELERY_APP":                          {},
+	"GUNICORN_CMD_ARGS":                   {},
+	"UVICORN_APP":                         {},
+	"UVICORN_APP_DIR":                     {},
+	"BUNDLE_GEMFILE":                      {},
+	"GEM_HOME":                            {},
+	"GEM_PATH":                            {},
+	"APP_NAME":                            {},
+}
+
+// keptEnvVariables returns the variables of envVars that keptEnvNames names
+func keptEnvVariables(envVars map[string]string) map[string]string {
+	if envVars == nil {
+		return nil
+	}
+	kept := make(map[string]string, len(keptEnvNames))
+	for name := range keptEnvNames {
+		if value, ok := envVars[name]; ok {
+			kept[name] = value
+		}
+	}
+	return kept
+}
+
 type Init struct {
 	Service        svc.Attrs
 	CmdExePath     string
@@ -306,14 +349,15 @@ func (fi *FileInfo) ApplyServiceDefaults(t svc.InstrumentableType) {
 	fi.service.SDKLanguage = t
 }
 
-// ApplyEnvVariables parses the process environment and updates the service
-// attributes (EnvVars, Metadata, UID name/namespace) from OTEL_SERVICE_NAME
-// and OTEL_RESOURCE_ATTRIBUTES. Intended for use during discovery.
+// ApplyEnvVariables keeps the variables keptEnvNames names from the process
+// environment and updates the service attributes (EnvVars, Metadata, UID
+// name/namespace) from OTEL_SERVICE_NAME and OTEL_RESOURCE_ATTRIBUTES.
+// Intended for use during discovery.
 func (fi *FileInfo) ApplyEnvVariables(envVars map[string]string) {
 	fi.mu.Lock()
 	defer fi.mu.Unlock()
 
-	fi.service.EnvVars = envVars
+	fi.service.EnvVars = keptEnvVariables(envVars)
 	m := maps.Clone(fi.service.Metadata)
 	if m == nil {
 		m = map[attr.Name]string{}

@@ -112,17 +112,19 @@ const (
 )
 
 type BpfGoAutoSpanT struct {
-	_    structs.HostLayout
-	Type uint8
-	Pad  [3]uint8
-	Size uint32
-	Pid  struct {
+	_         structs.HostLayout
+	Type      uint8
+	ParentSet uint8
+	Pad       [2]uint8
+	Size      uint32
+	Pid       struct {
 		_       structs.HostLayout
 		HostPid uint32
 		UserPid uint32
 		Ns      uint32
 	}
-	Buf [0]uint8
+	ParentSpanId [8]uint8
+	Buf          [0]uint8
 }
 
 type BpfHttp2GrpcRequestT struct {

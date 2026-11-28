@@ -12,6 +12,7 @@ import (
 	"time"
 	"unsafe"
 
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -88,6 +89,13 @@ func ReadGoAutoSpanEventIntoSpan(record *ringbuf.Record) (request.Span, bool, er
 	}
 
 	payload := record.RawSample[headerSize:]
+	if event.ParentSet != 0 {
+		withParent, err := autoSpanWithParent(payload, trace.SpanID(event.ParentSpanId))
+		if err != nil {
+			return request.Span{}, true, err
+		}
+		payload = withParent
+	}
 	span, err := readAutoSpanPayload(payload)
 	if err != nil {
 		return request.Span{}, true, err
@@ -101,6 +109,34 @@ func ReadGoAutoSpanEventIntoSpan(record *ringbuf.Record) (request.Span, bool, er
 	}
 
 	return span, false, nil
+}
+
+// autoSpanWithParent sets the parent span id the probe kept on a span payload that carries none
+func autoSpanWithParent(payload []byte, parent trace.SpanID) ([]byte, error) {
+	if !parent.IsValid() {
+		return payload, nil
+	}
+	var unmarshaler ptrace.JSONUnmarshaler
+	traces, err := unmarshaler.UnmarshalTraces(payload)
+	if err != nil {
+		return nil, fmt.Errorf("invalid Go Auto SDK span payload: %w", err)
+	}
+	resourceSpans := traces.ResourceSpans()
+	if resourceSpans.Len() != 1 || resourceSpans.At(0).ScopeSpans().Len() != 1 ||
+		resourceSpans.At(0).ScopeSpans().At(0).Spans().Len() != 1 {
+		return payload, nil
+	}
+	otelSpan := resourceSpans.At(0).ScopeSpans().At(0).Spans().At(0)
+	if !otelSpan.ParentSpanID().IsEmpty() {
+		return payload, nil
+	}
+	otelSpan.SetParentSpanID(pcommon.SpanID(parent))
+	var marshaler ptrace.JSONMarshaler
+	withParent, err := marshaler.MarshalTraces(traces)
+	if err != nil {
+		return nil, fmt.Errorf("invalid Go Auto SDK span payload: %w", err)
+	}
+	return withParent, nil
 }
 
 func readAutoSpanPayload(payload []byte) (request.Span, error) {

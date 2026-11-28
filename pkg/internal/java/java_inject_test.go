@@ -8,6 +8,7 @@ package javaagent
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"log/slog"
@@ -216,7 +217,7 @@ func TestJavaInjector_CopyAgent(t *testing.T) {
 
 				victim := filepath.Join(tmpDir, "victim")
 				require.NoError(t, os.WriteFile(victim, []byte("do not overwrite"), 0o644))
-				require.NoError(t, os.Symlink(victim, filepath.Join(targetDir, ObiJavaAgentFileName)))
+				require.NoError(t, os.Symlink(victim, filepath.Join(targetDir, testAgentFileName())))
 				return tmpDir
 			},
 			envVars:     map[string]string{},
@@ -273,6 +274,146 @@ func TestJavaInjector_CopyAgent(t *testing.T) {
 			}
 		})
 	}
+}
+
+func testAgentFileName() string {
+	return agentFileName(os.Geteuid(), sha256.Sum256(embeddedJavaAgentBytes))
+}
+
+func testCopyAgentRoot(t *testing.T) (string, string) {
+	t.Helper()
+	root := filepath.Join(t.TempDir(), "proc", "root")
+	tmp := filepath.Join(root, "tmp")
+	require.NoError(t, os.MkdirAll(tmp, 0o755))
+	return root, tmp
+}
+
+func testInjector() *JavaInjector {
+	return &JavaInjector{cfg: &obi.DefaultConfig, log: slog.With("component", "javaagent.Injector")}
+}
+
+func TestJavaInjector_CopyAgentNamesTheFileByUIDAndHash(t *testing.T) {
+	oldJavaAgentBytes := embeddedJavaAgentBytes
+	embeddedJavaAgentBytes = []byte("test agent content")
+	t.Cleanup(func() { embeddedJavaAgentBytes = oldJavaAgentBytes })
+
+	root, tmp := testCopyAgentRoot(t)
+	legacy := filepath.Join(tmp, ObiJavaAgentFileName)
+	require.NoError(t, os.WriteFile(legacy, []byte("an older agent"), 0o444))
+
+	path, err := testInjector().copyAgent(root, 1000, "")
+	require.NoError(t, err)
+
+	sum := sha256.Sum256(embeddedJavaAgentBytes)
+	want := fmt.Sprintf("obi-java-agent-%d-%x.jar", os.Geteuid(), sum[:8])
+	assert.Equal(t, filepath.Join("/tmp", want), path)
+	copied, err := os.ReadFile(filepath.Join(tmp, want))
+	require.NoError(t, err)
+	assert.Equal(t, embeddedJavaAgentBytes, copied)
+
+	legacyContent, err := os.ReadFile(legacy)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("an older agent"), legacyContent)
+
+	entries, err := os.ReadDir(tmp)
+	require.NoError(t, err)
+	assert.Len(t, entries, 2)
+}
+
+func TestJavaInjector_CopyAgentNamesAChangedAgentApart(t *testing.T) {
+	oldJavaAgentBytes := embeddedJavaAgentBytes
+	t.Cleanup(func() { embeddedJavaAgentBytes = oldJavaAgentBytes })
+
+	root, _ := testCopyAgentRoot(t)
+	embeddedJavaAgentBytes = []byte("agent one")
+	first, err := testInjector().copyAgent(root, 1000, "")
+	require.NoError(t, err)
+	embeddedJavaAgentBytes = []byte("agent two")
+	second, err := testInjector().copyAgent(root, 1000, "")
+	require.NoError(t, err)
+	assert.NotEqual(t, first, second)
+}
+
+func TestJavaInjector_CopyAgentSkipsTheCopyWhenTheAgentIsInPlace(t *testing.T) {
+	oldJavaAgentBytes := embeddedJavaAgentBytes
+	embeddedJavaAgentBytes = []byte("test agent content")
+	t.Cleanup(func() { embeddedJavaAgentBytes = oldJavaAgentBytes })
+
+	root, tmp := testCopyAgentRoot(t)
+	injector := testInjector()
+	first, err := injector.copyAgent(root, 1000, "")
+	require.NoError(t, err)
+	hostPath := filepath.Join(tmp, testAgentFileName())
+	before, err := os.Stat(hostPath)
+	require.NoError(t, err)
+
+	second, err := injector.copyAgent(root, 1001, "")
+	require.NoError(t, err)
+	assert.Equal(t, first, second)
+	after, err := os.Stat(hostPath)
+	require.NoError(t, err)
+	assert.True(t, os.SameFile(before, after))
+
+	entries, err := os.ReadDir(tmp)
+	require.NoError(t, err)
+	assert.Len(t, entries, 1)
+}
+
+func TestJavaInjector_CopyAgentReplacesAFileThatIsNotTheAgent(t *testing.T) {
+	oldJavaAgentBytes := embeddedJavaAgentBytes
+	embeddedJavaAgentBytes = []byte("test agent content")
+	t.Cleanup(func() { embeddedJavaAgentBytes = oldJavaAgentBytes })
+
+	tests := []struct {
+		name    string
+		content []byte
+		mode    os.FileMode
+	}{
+		{name: "same size, other bytes", content: []byte("test agent CONTENT"), mode: 0o644},
+		{name: "other size", content: []byte("short"), mode: 0o644},
+		{name: "group writable", content: []byte("test agent content"), mode: 0o664},
+		{name: "world writable", content: []byte("test agent content"), mode: 0o646},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root, tmp := testCopyAgentRoot(t)
+			hostPath := filepath.Join(tmp, testAgentFileName())
+			require.NoError(t, os.WriteFile(hostPath, tt.content, tt.mode))
+			require.NoError(t, os.Chmod(hostPath, tt.mode))
+			before, err := os.Stat(hostPath)
+			require.NoError(t, err)
+
+			_, err = testInjector().copyAgent(root, 1000, "")
+			require.NoError(t, err)
+
+			after, err := os.Stat(hostPath)
+			require.NoError(t, err)
+			assert.False(t, os.SameFile(before, after))
+			assert.Equal(t, os.FileMode(0o644), after.Mode().Perm())
+			copied, err := os.ReadFile(hostPath)
+			require.NoError(t, err)
+			assert.Equal(t, embeddedJavaAgentBytes, copied)
+		})
+	}
+}
+
+func TestJavaInjector_CopyAgentReplacesALinkAtTheAgentName(t *testing.T) {
+	oldJavaAgentBytes := embeddedJavaAgentBytes
+	embeddedJavaAgentBytes = []byte("test agent content")
+	t.Cleanup(func() { embeddedJavaAgentBytes = oldJavaAgentBytes })
+
+	root, tmp := testCopyAgentRoot(t)
+	elsewhere := filepath.Join(t.TempDir(), "agent")
+	require.NoError(t, os.WriteFile(elsewhere, embeddedJavaAgentBytes, 0o644))
+	hostPath := filepath.Join(tmp, testAgentFileName())
+	require.NoError(t, os.Symlink(elsewhere, hostPath))
+
+	_, err := testInjector().copyAgent(root, 1000, "")
+	require.NoError(t, err)
+
+	info, err := os.Lstat(hostPath)
+	require.NoError(t, err)
+	assert.True(t, info.Mode().IsRegular())
 }
 
 func TestJavaInjector_FindTempDir(t *testing.T) {

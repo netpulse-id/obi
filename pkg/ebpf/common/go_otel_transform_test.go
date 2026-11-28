@@ -35,7 +35,7 @@ var (
 
 func TestReadBPFTraceAsSpanGoAutoSpan(t *testing.T) {
 	assert.Equal(t, uint8(20), EventTypeGoAutoSpan)
-	assert.Equal(t, 20, int(unsafe.Offsetof(GoAutoSpanTrace{}.Buf)))
+	assert.Equal(t, 28, int(unsafe.Offsetof(GoAutoSpanTrace{}.Buf)))
 	assert.Equal(t, 16*1024, goAutoSpanJSONMaxLen)
 	assert.NotEqual(t, EventTypeGoRuntimeMetric, EventTypeGoAutoSpan)
 	assert.NotEqual(t, EventTypeGoChannelLink, EventTypeGoAutoSpan)
@@ -73,6 +73,51 @@ func TestReadBPFTraceAsSpanGoAutoSpan(t *testing.T) {
 	for i := range record.RawSample {
 		record.RawSample[i] = 0
 	}
+	assert.Equal(t, payload, span.ManualOTelJSON)
+}
+
+func TestReadGoAutoSpanEventKeepsTheProbeParent(t *testing.T) {
+	traces := validAutoSpanTraces()
+	traces.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).SetParentSpanID(pcommon.NewSpanIDEmpty())
+	payload := marshalAutoSpanPayload(t, traces)
+	record := goAutoSpanRecord(payload, uint32(len(payload)))
+	setGoAutoSpanParent(record, testAutoParentID)
+
+	span, ignore, err := ReadBPFTraceAsSpan(nil, nil, record, nil)
+	require.NoError(t, err)
+	assert.False(t, ignore)
+	assert.Equal(t, trace.SpanID(testAutoParentID), span.ParentSpanID)
+	assert.Equal(t, trace.SpanID(testAutoSpanID), span.SpanID)
+
+	var unmarshaler ptrace.JSONUnmarshaler
+	exported, err := unmarshaler.UnmarshalTraces(span.ManualOTelJSON)
+	require.NoError(t, err)
+	assert.Equal(t, testAutoParentID, exported.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).ParentSpanID())
+}
+
+func TestReadGoAutoSpanEventKeepsThePayloadParent(t *testing.T) {
+	payload := marshalAutoSpanPayload(t, validAutoSpanTraces())
+	record := goAutoSpanRecord(payload, uint32(len(payload)))
+	setGoAutoSpanParent(record, pcommon.SpanID{0, 0, 0, 0, 0, 0, 0, 9})
+
+	span, ignore, err := ReadBPFTraceAsSpan(nil, nil, record, nil)
+	require.NoError(t, err)
+	assert.False(t, ignore)
+	assert.Equal(t, trace.SpanID(testAutoParentID), span.ParentSpanID)
+	assert.Equal(t, payload, span.ManualOTelJSON)
+}
+
+func TestReadGoAutoSpanEventIgnoresAnInvalidProbeParent(t *testing.T) {
+	traces := validAutoSpanTraces()
+	traces.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).SetParentSpanID(pcommon.NewSpanIDEmpty())
+	payload := marshalAutoSpanPayload(t, traces)
+	record := goAutoSpanRecord(payload, uint32(len(payload)))
+	setGoAutoSpanParent(record, pcommon.NewSpanIDEmpty())
+
+	span, ignore, err := ReadBPFTraceAsSpan(nil, nil, record, nil)
+	require.NoError(t, err)
+	assert.False(t, ignore)
+	assert.False(t, span.ParentSpanID.IsValid())
 	assert.Equal(t, payload, span.ManualOTelJSON)
 }
 
@@ -333,4 +378,10 @@ func goAutoSpanRecord(payload []byte, size uint32) *ringbuf.Record {
 	raw = append(raw, header...)
 	raw = append(raw, payload...)
 	return &ringbuf.Record{RawSample: raw}
+}
+
+func setGoAutoSpanParent(record *ringbuf.Record, parent pcommon.SpanID) {
+	event := (*GoAutoSpanTrace)(unsafe.Pointer(unsafe.SliceData(record.RawSample)))
+	event.ParentSet = 1
+	event.ParentSpanId = parent
 }

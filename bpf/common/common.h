@@ -290,9 +290,11 @@ typedef struct channel_link_trace {
 
 typedef struct go_auto_span {
     u8 type; // Must be first
-    u8 _pad[3];
+    u8 parent_set;
+    u8 _pad[2];
     u32 size;
     pid_info pid;
+    unsigned char parent_span_id[SPAN_ID_SIZE_BYTES];
     unsigned char buf[];
 } go_auto_span_t;
 

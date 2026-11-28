@@ -134,14 +134,15 @@ type BpfGoAutoActivationAttemptKeyT struct {
 }
 
 type BpfGoAutoSpanStateT struct {
-	_          structs.HostLayout
-	PrevTp     BpfTpInfoT
-	ChildTp    BpfTpInfoT
-	Goroutine  uint64
-	Generation uint64
-	Committed  uint8
-	Sdk        uint8
-	Pad        [6]uint8
+	_             structs.HostLayout
+	PrevTp        BpfTpInfoT
+	ChildTp       BpfTpInfoT
+	Goroutine     uint64
+	Generation    uint64
+	Committed     uint8
+	Sdk           uint8
+	ParentPending uint8
+	Pad           [5]uint8
 }
 
 type BpfGoExecutableKeyT struct {

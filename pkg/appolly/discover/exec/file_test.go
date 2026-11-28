@@ -17,6 +17,7 @@ func TestApplyEnvVariables(t *testing.T) {
 		expectName string
 		expectNS   string
 		expectMeta map[attr.Name]string
+		expectEnv  map[string]string
 	}{
 		{
 			name:       "OTEL_SERVICE_NAME present, but also name is in the OTEL_RESOURCE_ATTRIBUTES",
@@ -54,6 +55,7 @@ func TestApplyEnvVariables(t *testing.T) {
 			name:       "No relevant env vars",
 			envVars:    map[string]string{"FOO": "BAR"},
 			expectMeta: map[attr.Name]string{},
+			expectEnv:  map[string]string{},
 		},
 		{
 			name:       "Improper resource attributes, no key - value pairs",
@@ -93,8 +95,12 @@ func TestApplyEnvVariables(t *testing.T) {
 			if got := snap.UID.Namespace; got != tt.expectNS {
 				t.Errorf("UID.Namespace = %q, want %q", got, tt.expectNS)
 			}
-			if !reflect.DeepEqual(snap.EnvVars, tt.envVars) {
-				t.Errorf("EnvVars = %#v, want %#v", snap.EnvVars, tt.envVars)
+			wantEnv := tt.envVars
+			if tt.expectEnv != nil {
+				wantEnv = tt.expectEnv
+			}
+			if !reflect.DeepEqual(snap.EnvVars, wantEnv) {
+				t.Errorf("EnvVars = %#v, want %#v", snap.EnvVars, wantEnv)
 			}
 			if !reflect.DeepEqual(snap.Metadata, tt.expectMeta) {
 				t.Errorf("Metadata = %#v, want %#v", snap.Metadata, tt.expectMeta)
@@ -107,5 +113,59 @@ func TestFileInfoKeepsProcessStartTime(t *testing.T) {
 	info := New(Init{StartTime: 42})
 	if info.StartTime() != 42 {
 		t.Fatalf("StartTime() = %d, want 42", info.StartTime())
+	}
+}
+
+func TestApplyEnvVariablesKeepsOnlyNamedVariables(t *testing.T) {
+	envVars := map[string]string{
+		"DATABASE_PASSWORD":           "secret",
+		"OTEL_EXPORTER_OTLP_HEADERS":  "authorization=Bearer token",
+		"AWS_SECRET_ACCESS_KEY":       "secret",
+		"otel_service_name":           "lower-case",
+		"OTEL_SERVICE_NAME":           "my-service",
+		"TMPDIR":                      "/custom/tmp",
+		"PYTHONPATH":                  "/app",
+		"OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector:4318",
+	}
+	want := map[string]string{
+		"OTEL_SERVICE_NAME":           "my-service",
+		"TMPDIR":                      "/custom/tmp",
+		"PYTHONPATH":                  "/app",
+		"OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector:4318",
+	}
+
+	fi := New(Init{})
+	fi.ApplyEnvVariables(envVars)
+	if got := fi.ServiceAttrs().EnvVars; !reflect.DeepEqual(got, want) {
+		t.Errorf("EnvVars = %#v, want %#v", got, want)
+	}
+	if got := fi.ServiceAttrs().UID.Name; got != "my-service" {
+		t.Errorf("UID.Name = %q, want %q", got, "my-service")
+	}
+}
+
+func TestApplyEnvVariablesKeepsEveryNamedVariable(t *testing.T) {
+	envVars := map[string]string{}
+	for name := range keptEnvNames {
+		envVars[name] = "v"
+	}
+	envVars["UNNAMED"] = "v"
+
+	fi := New(Init{})
+	fi.ApplyEnvVariables(envVars)
+	got := fi.ServiceAttrs().EnvVars
+	if len(got) != len(keptEnvNames) {
+		t.Errorf("kept %d variables, want %d", len(got), len(keptEnvNames))
+	}
+	if _, ok := got["UNNAMED"]; ok {
+		t.Errorf("UNNAMED kept")
+	}
+}
+
+func TestApplyEnvVariablesWithNoEnvironmentKeepsNone(t *testing.T) {
+	fi := New(Init{})
+	fi.ApplyEnvVariables(nil)
+	if got := fi.ServiceAttrs().EnvVars; got != nil {
+		t.Errorf("EnvVars = %#v, want nil", got)
 	}
 }

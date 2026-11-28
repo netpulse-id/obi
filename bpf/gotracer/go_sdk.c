@@ -73,7 +73,8 @@ typedef struct go_auto_span_state {
     u64 generation;
     u8 committed;
     u8 sdk;
-    u8 _pad[6];
+    u8 parent_pending;
+    u8 _pad[5];
 } go_auto_span_state_t;
 
 struct {
@@ -649,7 +650,14 @@ static __always_inline int auto_sdk_tracer_start(struct pt_regs *ctx, u8 sdk) {
     }
 
     long ret = write_go_auto_parent_span_context(parent_span_context, &state);
-    if (ret != 0) {
+    if (ret == -k_efault) {
+        // The parent goes out with the ended span when its Go memory is not yet paged in
+        state.parent_pending = 1;
+        if (bpf_map_update_elem(&active_go_auto_spans, &s_key, &state, BPF_EXIST) != 0) {
+            bpf_map_delete_elem(&active_go_auto_spans, &s_key);
+            return 0;
+        }
+    } else if (ret != 0) {
         bpf_map_delete_elem(&active_go_auto_spans, &s_key);
         return 0;
     }
@@ -788,6 +796,11 @@ int GUARDED_PROG(obi_uprobe_auto_sdk_span_Ended, struct pt_regs *, ctx) {
     __builtin_memset(event, 0, offsetof(go_auto_span_t, buf));
     event->type = k_event_type_go_auto_span;
     event->size = (u32)len;
+    if (state.parent_pending && valid_span(state.child_tp.parent_id)) {
+        event->parent_set = 1;
+        __builtin_memcpy(
+            event->parent_span_id, state.child_tp.parent_id, sizeof(event->parent_span_id));
+    }
     task_pid(&event->pid);
 
     if (bpf_probe_read_user(event->buf, len, data_ptr) != 0) {

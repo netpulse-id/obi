@@ -9,6 +9,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	_ "embed"
 	"errors"
 	"fmt"
@@ -32,6 +33,7 @@ import (
 const (
 	ObiJavaAgentFileName      = "obi-java-agent.jar"
 	javaAgentEmbedPlaceholder = "OBI_JAVA_AGENT_PLACEHOLDER"
+	agentFileSumBytes         = 8
 )
 
 //go:embed embedded/obi-java-agent.jar
@@ -386,10 +388,17 @@ func (i *JavaInjector) copyAgent(root string, pid app.PID, tempDirEnv string) (s
 
 	i.log.Info("found injection directory for process", "pid", pid, "path", fullTempDir)
 
-	agentPathHost := filepath.Join(fullTempDir, ObiJavaAgentFileName)
+	agentSum := sha256.Sum256(embeddedJavaAgentBytes)
+	agentName := agentFileName(os.Geteuid(), agentSum)
+	agentPathHost := filepath.Join(fullTempDir, agentName)
+	agentPathContainer := filepath.Join(tempDir, agentName)
+	if agentInPlace(agentPathHost, agentSum) {
+		i.log.Debug("java agent already in place", "pid", pid, "path", agentPathContainer)
+		return agentPathContainer, nil
+	}
 
 	source := bytes.NewReader(embeddedJavaAgentBytes)
-	target, err := os.CreateTemp(fullTempDir, ObiJavaAgentFileName+".tmp-*")
+	target, err := os.CreateTemp(fullTempDir, agentName+".tmp-*")
 	if err != nil {
 		return "", fmt.Errorf("unable to create target OBI java agent: %w", err)
 	}
@@ -418,9 +427,36 @@ func (i *JavaInjector) copyAgent(root string, pid app.PID, tempDirEnv string) (s
 	}
 	cleanup = false
 
-	agentPathContainer := filepath.Join(tempDir, ObiJavaAgentFileName)
-
 	return agentPathContainer, nil
+}
+
+// agentFileName names the agent file by the sensor's uid and the agent's content hash
+func agentFileName(uid int, sum [sha256.Size]byte) string {
+	return fmt.Sprintf("obi-java-agent-%d-%x.jar", uid, sum[:agentFileSumBytes])
+}
+
+// agentInPlace reports whether path is a regular file of the sensor's uid, writable by no other user, holding the embedded agent
+func agentInPlace(path string, sum [sha256.Size]byte) bool {
+	file, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
+		return false
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG || int(stat.Uid) != os.Geteuid() ||
+		stat.Mode&0o022 != 0 || stat.Size != int64(len(embeddedJavaAgentBytes)) {
+		return false
+	}
+
+	hash := sha256.New()
+	if _, err := io.Copy(hash, io.LimitReader(file, stat.Size+1)); err != nil {
+		return false
+	}
+	return bytes.Equal(hash.Sum(nil), sum[:])
 }
 
 func returnCodeLine(line string) (bool, error) {
