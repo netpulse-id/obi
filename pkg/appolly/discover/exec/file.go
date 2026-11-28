@@ -8,6 +8,7 @@ import (
 	"debug/elf"
 	"io"
 	"maps"
+	"net/url"
 	"strings"
 	"sync"
 
@@ -16,6 +17,7 @@ import (
 	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
 	"go.opentelemetry.io/obi/pkg/export/attributes"
 	attr "go.opentelemetry.io/obi/pkg/export/attributes/names"
+	"go.opentelemetry.io/obi/pkg/internal/pythontools/frameworks"
 	"go.opentelemetry.io/obi/pkg/internal/transform/route"
 )
 
@@ -55,18 +57,42 @@ var keptEnvNames = map[string]struct{}{
 	"APP_NAME":                            {},
 }
 
-// keptEnvVariables returns the variables of envVars that keptEnvNames names
+// keptEnvParts reduces the kept variables whose readers use only a part of the value to that part
+var keptEnvParts = map[string]func(string) (string, bool){
+	"OTEL_EXPORTER_OTLP_ENDPOINT":         endpointOrigin,
+	"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT":  endpointOrigin,
+	"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": endpointOrigin,
+	"GUNICORN_CMD_ARGS":                   frameworks.KeptGunicornCmdArgs,
+}
+
+// keptEnvVariables returns the variables of envVars that keptEnvNames names, each reduced to the part its readers use
 func keptEnvVariables(envVars map[string]string) map[string]string {
 	if envVars == nil {
 		return nil
 	}
 	kept := make(map[string]string, len(keptEnvNames))
 	for name := range keptEnvNames {
-		if value, ok := envVars[name]; ok {
-			kept[name] = value
+		value, ok := envVars[name]
+		if !ok {
+			continue
 		}
+		if part, reduces := keptEnvParts[name]; reduces {
+			if value, ok = part(value); !ok {
+				continue
+			}
+		}
+		kept[name] = value
 	}
 	return kept
+}
+
+// endpointOrigin returns the scheme, host and port of an endpoint URL, and false when it names no scheme and host
+func endpointOrigin(value string) (string, bool) {
+	u, err := url.Parse(value)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "", false
+	}
+	return u.Scheme + "://" + u.Host, true
 }
 
 type Init struct {

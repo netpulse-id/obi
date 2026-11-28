@@ -34,6 +34,8 @@ const (
 	ObiJavaAgentFileName      = "obi-java-agent.jar"
 	javaAgentEmbedPlaceholder = "OBI_JAVA_AGENT_PLACEHOLDER"
 	agentFileSumBytes         = 8
+	maxAgentDirEntries        = 65536
+	agentDirBatch             = 256
 )
 
 //go:embed embedded/obi-java-agent.jar
@@ -427,6 +429,10 @@ func (i *JavaInjector) copyAgent(root string, pid app.PID, tempDirEnv string) (s
 	}
 	cleanup = false
 
+	if removed := removeOlderAgents(fullTempDir, agentName); removed > 0 {
+		i.log.Debug("removed older java agents", "pid", pid, "count", removed)
+	}
+
 	return agentPathContainer, nil
 }
 
@@ -435,20 +441,40 @@ func agentFileName(uid int, sum [sha256.Size]byte) string {
 	return fmt.Sprintf("obi-java-agent-%d-%x.jar", uid, sum[:agentFileSumBytes])
 }
 
-// agentInPlace reports whether path is a regular file of the sensor's uid, writable by no other user, holding the embedded agent
+// ownedRegularFile takes a handle on path that opens nothing and reports whether it names a regular file of the sensor's uid that no other user can write
+func ownedRegularFile(path string) (*os.File, unix.Stat_t, bool) {
+	var stat unix.Stat_t
+	fd, err := unix.Open(path, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, stat, false
+	}
+	handle := os.NewFile(uintptr(fd), path)
+	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG ||
+		int(stat.Uid) != os.Geteuid() || stat.Mode&0o022 != 0 {
+		_ = handle.Close()
+		return nil, stat, false
+	}
+	return handle, stat, true
+}
+
+// agentInPlace reports whether path is a regular file of the sensor's uid, writable by no other user, holding the embedded agent, reading it only once its handle shows a regular file
 func agentInPlace(path string, sum [sha256.Size]byte) bool {
-	file, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	handle, stat, ok := ownedRegularFile(path)
+	if !ok {
+		return false
+	}
+	defer handle.Close()
+	if stat.Size != int64(len(embeddedJavaAgentBytes)) {
+		return false
+	}
+
+	file, err := os.OpenFile(fmt.Sprintf("/proc/self/fd/%d", handle.Fd()), os.O_RDONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return false
 	}
 	defer file.Close()
-
-	var stat unix.Stat_t
-	if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
-		return false
-	}
-	if stat.Mode&unix.S_IFMT != unix.S_IFREG || int(stat.Uid) != os.Geteuid() ||
-		stat.Mode&0o022 != 0 || stat.Size != int64(len(embeddedJavaAgentBytes)) {
+	var reopened unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &reopened); err != nil || reopened.Dev != stat.Dev || reopened.Ino != stat.Ino {
 		return false
 	}
 
@@ -457,6 +483,55 @@ func agentInPlace(path string, sum [sha256.Size]byte) bool {
 		return false
 	}
 	return bytes.Equal(hash.Sum(nil), sum[:])
+}
+
+// olderAgentFile reports whether name is an agent file name of the given uid prefix other than keep
+func olderAgentFile(name, prefix, keep string) bool {
+	if name == keep || len(name) != len(prefix)+2*agentFileSumBytes+len(".jar") ||
+		!strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".jar") {
+		return false
+	}
+	for _, c := range name[len(prefix) : len(prefix)+2*agentFileSumBytes] {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// removeOlderAgents removes from dir the agent files of the sensor's uid other than keep that are regular files it owns, reading at most maxAgentDirEntries entries, and returns how many it removed
+func removeOlderAgents(dir, keep string) int {
+	fd, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return 0
+	}
+	d := os.NewFile(uintptr(fd), dir)
+	defer d.Close()
+
+	prefix := fmt.Sprintf("obi-java-agent-%d-", os.Geteuid())
+	removed := 0
+	for read := 0; read < maxAgentDirEntries; {
+		names, err := d.Readdirnames(agentDirBatch)
+		read += len(names)
+		for _, name := range names {
+			if !olderAgentFile(name, prefix, keep) {
+				continue
+			}
+			path := filepath.Join(dir, name)
+			handle, _, ok := ownedRegularFile(path)
+			if !ok {
+				continue
+			}
+			_ = handle.Close()
+			if unix.Unlink(path) == nil {
+				removed++
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	return removed
 }
 
 func returnCodeLine(line string) (bool, error) {

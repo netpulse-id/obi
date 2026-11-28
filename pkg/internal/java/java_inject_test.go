@@ -21,6 +21,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 
 	"go.opentelemetry.io/obi/pkg/appolly/app"
 	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
@@ -414,6 +415,108 @@ func TestJavaInjector_CopyAgentReplacesALinkAtTheAgentName(t *testing.T) {
 	info, err := os.Lstat(hostPath)
 	require.NoError(t, err)
 	assert.True(t, info.Mode().IsRegular())
+}
+
+func TestAgentInPlace_NeverOpensAFifoAtTheAgentName(t *testing.T) {
+	oldJavaAgentBytes := embeddedJavaAgentBytes
+	embeddedJavaAgentBytes = []byte("test agent content")
+	t.Cleanup(func() { embeddedJavaAgentBytes = oldJavaAgentBytes })
+
+	path := filepath.Join(t.TempDir(), testAgentFileName())
+	require.NoError(t, unix.Mkfifo(path, 0o644))
+	opened := make(chan struct{})
+	go func() {
+		if writer, err := os.OpenFile(path, os.O_WRONLY, 0); err == nil {
+			close(opened)
+			_ = writer.Close()
+		}
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	assert.False(t, agentInPlace(path, sha256.Sum256(embeddedJavaAgentBytes)))
+	select {
+	case <-opened:
+		t.Fatal("the FIFO at the agent name was opened")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	reader, err := os.OpenFile(path, os.O_RDONLY|unix.O_NONBLOCK, 0)
+	require.NoError(t, err)
+	<-opened
+	require.NoError(t, reader.Close())
+}
+
+func TestAgentInPlace_TakesOnlyARegularFileOfTheSensorsUID(t *testing.T) {
+	oldJavaAgentBytes := embeddedJavaAgentBytes
+	embeddedJavaAgentBytes = []byte("test agent content")
+	t.Cleanup(func() { embeddedJavaAgentBytes = oldJavaAgentBytes })
+	sum := sha256.Sum256(embeddedJavaAgentBytes)
+
+	dir := t.TempDir()
+	regular := filepath.Join(dir, "regular.jar")
+	require.NoError(t, os.WriteFile(regular, embeddedJavaAgentBytes, 0o644))
+	assert.True(t, agentInPlace(regular, sum))
+
+	link := filepath.Join(dir, "link.jar")
+	require.NoError(t, os.Symlink(regular, link))
+	assert.False(t, agentInPlace(link, sum))
+
+	sub := filepath.Join(dir, "dir.jar")
+	require.NoError(t, os.Mkdir(sub, 0o755))
+	assert.False(t, agentInPlace(sub, sum))
+
+	assert.False(t, agentInPlace(filepath.Join(dir, "absent.jar"), sum))
+}
+
+func TestJavaInjector_CopyAgentRemovesOlderAgentsOfTheSensorsUID(t *testing.T) {
+	oldJavaAgentBytes := embeddedJavaAgentBytes
+	embeddedJavaAgentBytes = []byte("test agent content")
+	t.Cleanup(func() { embeddedJavaAgentBytes = oldJavaAgentBytes })
+
+	root, tmp := testCopyAgentRoot(t)
+	uid := os.Geteuid()
+	older := []string{
+		fmt.Sprintf("obi-java-agent-%d-0000000000000001.jar", uid),
+		fmt.Sprintf("obi-java-agent-%d-00000000000000ff.jar", uid),
+	}
+	for _, name := range older {
+		require.NoError(t, os.WriteFile(filepath.Join(tmp, name), []byte("old"), 0o644))
+	}
+	kept := []string{
+		ObiJavaAgentFileName,
+		fmt.Sprintf("obi-java-agent-%d-00000000000000FF.jar", uid),
+		fmt.Sprintf("obi-java-agent-%d-000000000000001.jar", uid),
+		fmt.Sprintf("obi-java-agent-%d-0000000000000002.jar.tmp-1", uid),
+		fmt.Sprintf("obi-java-agent-%d-0000000000000003.jar", uid+1),
+		"application.jar",
+	}
+	for _, name := range kept {
+		require.NoError(t, os.WriteFile(filepath.Join(tmp, name), []byte("other"), 0o644))
+	}
+	notRegular := fmt.Sprintf("obi-java-agent-%d-0000000000000004.jar", uid)
+	require.NoError(t, os.Mkdir(filepath.Join(tmp, notRegular), 0o755))
+	linked := fmt.Sprintf("obi-java-agent-%d-0000000000000005.jar", uid)
+	target := filepath.Join(t.TempDir(), "target")
+	require.NoError(t, os.WriteFile(target, []byte("target"), 0o644))
+	require.NoError(t, os.Symlink(target, filepath.Join(tmp, linked)))
+	writable := fmt.Sprintf("obi-java-agent-%d-0000000000000006.jar", uid)
+	require.NoError(t, os.WriteFile(filepath.Join(tmp, writable), []byte("shared"), 0o666))
+	require.NoError(t, os.Chmod(filepath.Join(tmp, writable), 0o666))
+
+	_, err := testInjector().copyAgent(root, 1000, "")
+	require.NoError(t, err)
+
+	for _, name := range older {
+		_, err := os.Lstat(filepath.Join(tmp, name))
+		assert.True(t, os.IsNotExist(err), name)
+	}
+	for _, name := range append(kept, notRegular, linked, writable, testAgentFileName()) {
+		_, err := os.Lstat(filepath.Join(tmp, name))
+		assert.NoError(t, err, name)
+	}
+	targetContent, err := os.ReadFile(target)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("target"), targetContent)
 }
 
 func TestJavaInjector_FindTempDir(t *testing.T) {

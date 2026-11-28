@@ -149,6 +149,10 @@ func TestApplyEnvVariablesKeepsEveryNamedVariable(t *testing.T) {
 	for name := range keptEnvNames {
 		envVars[name] = "v"
 	}
+	for _, name := range []string{"OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"} {
+		envVars[name] = "http://collector:4318"
+	}
+	envVars["GUNICORN_CMD_ARGS"] = "--name=web"
 	envVars["UNNAMED"] = "v"
 
 	fi := New(Init{})
@@ -167,5 +171,41 @@ func TestApplyEnvVariablesWithNoEnvironmentKeepsNone(t *testing.T) {
 	fi.ApplyEnvVariables(nil)
 	if got := fi.ServiceAttrs().EnvVars; got != nil {
 		t.Errorf("EnvVars = %#v, want nil", got)
+	}
+}
+
+func TestApplyEnvVariablesKeepsAnEndpointsSchemeHostAndPortOnly(t *testing.T) {
+	tests := map[string]string{
+		"https://user:token@collector:4318/v1/traces?key=secret": "https://collector:4318",
+		"http://collector:4317":                                  "http://collector:4317",
+		"http://[::1]:4318/":                                     "http://[::1]:4318",
+	}
+	for value, want := range tests {
+		fi := New(Init{})
+		fi.ApplyEnvVariables(map[string]string{"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": value})
+		if got := fi.ServiceAttrs().EnvVars["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"]; got != want {
+			t.Errorf("%q kept as %q, want %q", value, got, want)
+		}
+	}
+	for _, value := range []string{"collector:4317", "/v1/traces", "http://%zz", ""} {
+		fi := New(Init{})
+		fi.ApplyEnvVariables(map[string]string{"OTEL_EXPORTER_OTLP_ENDPOINT": value})
+		if got, ok := fi.ServiceAttrs().EnvVars["OTEL_EXPORTER_OTLP_ENDPOINT"]; ok {
+			t.Errorf("%q kept as %q, want it dropped", value, got)
+		}
+	}
+}
+
+func TestApplyEnvVariablesKeepsOnlyTheGunicornSettingsRead(t *testing.T) {
+	fi := New(Init{})
+	fi.ApplyEnvVariables(map[string]string{"GUNICORN_CMD_ARGS": "--env DB_PASSWORD=secret -b 0.0.0.0:8000 --chdir /srv/app --name web --keyfile /run/key.pem"})
+	if got, want := fi.ServiceAttrs().EnvVars["GUNICORN_CMD_ARGS"], "--chdir='/srv/app' --name='web'"; got != want {
+		t.Errorf("GUNICORN_CMD_ARGS = %q, want %q", got, want)
+	}
+
+	fi = New(Init{})
+	fi.ApplyEnvVariables(map[string]string{"GUNICORN_CMD_ARGS": "--not-an-option secret"})
+	if got, ok := fi.ServiceAttrs().EnvVars["GUNICORN_CMD_ARGS"]; ok {
+		t.Errorf("an unparsed GUNICORN_CMD_ARGS kept as %q", got)
 	}
 }

@@ -204,3 +204,32 @@ var gunicornOptionsWithoutValues = optionSet(
 	"--permit-unconventional-http-method", "--permit-unconventional-http-version", "--casefold-http-method",
 	"--no-control-socket", "-h", "--help", "-v", "--version", "--proxy-protocol",
 )
+
+// KeptGunicornCmdArgs returns a GUNICORN_CMD_ARGS value reduced to the settings ParseGunicorn reads from it, and false when the value does not parse
+func KeptGunicornCmdArgs(value string) (string, bool) {
+	fields, ok := splitShellFields(value)
+	if !ok {
+		return "", false
+	}
+	if _, ok := gunicornPositionals(fields); !ok {
+		return "", false
+	}
+	var settings gunicornSettings
+	applyGunicornSettings(fields, &settings)
+	var kept []string
+	for _, setting := range [...]struct{ flag, value string }{
+		{"--chdir", settings.chdir},
+		{"--pythonpath", settings.pythonPath},
+		{"--name", settings.name},
+	} {
+		if setting.value != "" {
+			kept = append(kept, setting.flag+"="+shellQuoted(setting.value))
+		}
+	}
+	return strings.Join(kept, " "), true
+}
+
+// shellQuoted quotes a value so splitShellFields reads it back as one field
+func shellQuoted(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
+}

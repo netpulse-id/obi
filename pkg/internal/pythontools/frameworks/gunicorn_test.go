@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestParseGunicornOptions(t *testing.T) {
@@ -158,4 +159,27 @@ func TestParseGunicornProxyProtocolOption(t *testing.T) {
 	}
 
 	assert.Equal(t, PythonLaunch{}, ParseGunicorn([]string{"--proxy-protocol=invalid", application}, nil))
+}
+
+func TestKeptGunicornCmdArgsParsesAsTheOriginal(t *testing.T) {
+	args := []string{"gunicorn", "app:create_app()"}
+	for _, value := range []string{
+		"",
+		"--chdir /srv/app",
+		"--chdir=/srv/app --pythonpath src,lib -n web",
+		"-e SECRET=x --name \"it's web\" --pythonpath=/opt/a\\ b",
+		"--workers 4 --env TOKEN=abc -- extra",
+		"--name first --name second",
+	} {
+		kept, ok := KeptGunicornCmdArgs(value)
+		require.True(t, ok, value)
+		assert.NotContains(t, kept, "SECRET")
+		assert.NotContains(t, kept, "TOKEN")
+		assert.Equal(t, ParseGunicorn(args[1:], map[string]string{"GUNICORN_CMD_ARGS": value}),
+			ParseGunicorn(args[1:], map[string]string{"GUNICORN_CMD_ARGS": kept}), value)
+	}
+	for _, value := range []string{"--unknown-option x", "--chdir"} {
+		_, ok := KeptGunicornCmdArgs(value)
+		assert.False(t, ok, value)
+	}
 }
