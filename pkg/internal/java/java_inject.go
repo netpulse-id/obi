@@ -121,19 +121,48 @@ func tempDirPath(root, dir string) (string, bool) {
 }
 
 func dirOK(root, dir string) bool {
-	fullDir, ok := tempDirPath(root, dir)
-	if !ok {
+	if _, ok := tempDirPath(root, dir); !ok {
 		return false
 	}
 
-	info, err := os.Stat(fullDir)
-	if err != nil || !info.IsDir() {
+	opened, err := openInRoot(root, dir)
+	if err != nil {
 		return false
 	}
+	defer opened.Close()
 
 	// X_OK on directory doesn't mean execute, it means search/traverse, which the JVM will do when
 	// loading the agent.
-	return unix.Faccessat(unix.AT_FDCWD, fullDir, unix.R_OK|unix.W_OK|unix.X_OK, unix.AT_EACCESS) == nil
+	return unix.Faccessat(unix.AT_FDCWD, fdPath(opened), unix.R_OK|unix.W_OK|unix.X_OK, unix.AT_EACCESS) == nil
+}
+
+// openInRoot opens dir below root one component at a time and refuses a component that is a link, so the directory is the one the process itself reaches at that path
+func openInRoot(root, dir string) (*os.File, error) {
+	current, err := unix.Open(root, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	for _, part := range strings.Split(strings.Trim(filepath.Clean(dir), "/"), "/") {
+		if part == "" {
+			continue
+		}
+		if part == ".." {
+			_ = unix.Close(current)
+			return nil, errors.New("a parent directory component")
+		}
+		next, err := unix.Openat(current, part, unix.O_PATH|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		_ = unix.Close(current)
+		if err != nil {
+			return nil, err
+		}
+		current = next
+	}
+	return os.NewFile(uintptr(current), dir), nil
+}
+
+// fdPath returns the path of an open file through the process's own descriptor table
+func fdPath(file *os.File) string {
+	return fmt.Sprintf("/proc/self/fd/%d", file.Fd())
 }
 
 func (i *JavaInjector) findTempDir(root, tempDirEnv string) (string, error) {
@@ -390,9 +419,16 @@ func (i *JavaInjector) copyAgent(root string, pid app.PID, tempDirEnv string) (s
 
 	i.log.Info("found injection directory for process", "pid", pid, "path", fullTempDir)
 
+	dir, err := openInRoot(root, tempDir)
+	if err != nil {
+		return "", fmt.Errorf("unable to open the injection directory inside the process root: %w", err)
+	}
+	defer dir.Close()
+	dirPath := fdPath(dir)
+
 	agentSum := sha256.Sum256(embeddedJavaAgentBytes)
 	agentName := agentFileName(os.Geteuid(), agentSum)
-	agentPathHost := filepath.Join(fullTempDir, agentName)
+	agentPathHost := filepath.Join(dirPath, agentName)
 	agentPathContainer := filepath.Join(tempDir, agentName)
 	if agentInPlace(agentPathHost, agentSum) {
 		i.log.Debug("java agent already in place", "pid", pid, "path", agentPathContainer)
@@ -400,7 +436,7 @@ func (i *JavaInjector) copyAgent(root string, pid app.PID, tempDirEnv string) (s
 	}
 
 	source := bytes.NewReader(embeddedJavaAgentBytes)
-	target, err := os.CreateTemp(fullTempDir, agentName+".tmp-*")
+	target, err := os.CreateTemp(dirPath, agentName+".tmp-*")
 	if err != nil {
 		return "", fmt.Errorf("unable to create target OBI java agent: %w", err)
 	}
@@ -429,7 +465,7 @@ func (i *JavaInjector) copyAgent(root string, pid app.PID, tempDirEnv string) (s
 	}
 	cleanup = false
 
-	if removed := removeOlderAgents(fullTempDir, agentName); removed > 0 {
+	if removed := removeOlderAgents(dirPath, agentName); removed > 0 {
 		i.log.Debug("removed older java agents", "pid", pid, "count", removed)
 	}
 
@@ -499,9 +535,9 @@ func olderAgentFile(name, prefix, keep string) bool {
 	return true
 }
 
-// removeOlderAgents removes from dir the agent files of the sensor's uid other than keep that are regular files it owns, reading at most maxAgentDirEntries entries, and returns how many it removed
+// removeOlderAgents removes from dir, a directory path of the sensor's own, the agent files of the sensor's uid other than keep that are regular files it owns, reading at most maxAgentDirEntries entries, and returns how many it removed
 func removeOlderAgents(dir, keep string) int {
-	fd, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	fd, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return 0
 	}

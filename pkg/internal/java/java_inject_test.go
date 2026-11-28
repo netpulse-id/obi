@@ -519,6 +519,61 @@ func TestJavaInjector_CopyAgentRemovesOlderAgentsOfTheSensorsUID(t *testing.T) {
 	assert.Equal(t, []byte("target"), targetContent)
 }
 
+func TestJavaInjector_CopyAgentNeverFollowsALinkOutOfTheProcessRoot(t *testing.T) {
+	oldJavaAgentBytes := embeddedJavaAgentBytes
+	embeddedJavaAgentBytes = []byte("test agent content")
+	t.Cleanup(func() { embeddedJavaAgentBytes = oldJavaAgentBytes })
+
+	root := filepath.Join(t.TempDir(), "proc", "root")
+	require.NoError(t, os.MkdirAll(root, 0o755))
+	outside := t.TempDir()
+	require.NoError(t, os.Symlink(outside, filepath.Join(root, "tmp")))
+
+	_, err := testInjector().copyAgent(root, 1000, "")
+	require.Error(t, err)
+	entries, err := os.ReadDir(outside)
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+}
+
+func TestJavaInjector_CopyAgentPassesOverATempDirectoryReachedThroughALink(t *testing.T) {
+	oldJavaAgentBytes := embeddedJavaAgentBytes
+	embeddedJavaAgentBytes = []byte("test agent content")
+	t.Cleanup(func() { embeddedJavaAgentBytes = oldJavaAgentBytes })
+
+	root := filepath.Join(t.TempDir(), "proc", "root")
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "data", "tmp"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "var", "tmp"), 0o755))
+	require.NoError(t, os.Symlink("/data/tmp", filepath.Join(root, "tmp")))
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "custom"), 0o755))
+	require.NoError(t, os.Symlink("/data/tmp", filepath.Join(root, "custom", "tmp")))
+
+	path, err := testInjector().copyAgent(root, 1000, "/custom/tmp")
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join("/var/tmp", testAgentFileName()), path)
+	_, err = os.Stat(filepath.Join(root, "var", "tmp", testAgentFileName()))
+	require.NoError(t, err)
+	entries, err := os.ReadDir(filepath.Join(root, "data", "tmp"))
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+}
+
+func TestOpenInRoot_OpensANestedDirectoryAndRefusesAParentComponent(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "a", "b"), 0o755))
+
+	opened, err := openInRoot(root, "/a/b")
+	require.NoError(t, err)
+	var want, got unix.Stat_t
+	require.NoError(t, unix.Stat(filepath.Join(root, "a", "b"), &want))
+	require.NoError(t, unix.Fstat(int(opened.Fd()), &got))
+	assert.Equal(t, want.Ino, got.Ino)
+	require.NoError(t, opened.Close())
+
+	_, err = openInRoot(root, "a/../../b")
+	require.Error(t, err)
+}
+
 func TestJavaInjector_FindTempDir(t *testing.T) {
 	tests := []struct {
 		name        string
